@@ -762,7 +762,7 @@ it.effect("a refresh starts a pass only once the last one is fifteen seconds old
   }).pipe(Effect.scoped, Effect.provide(Layer.merge(persistence, NodeServices.layer))),
 );
 
-it.effect("lists nothing, opens nothing and keeps no index while the setting is off", () =>
+it.effect("lists, opens and imports nothing and keeps no index while the setting is off", () =>
   Effect.gen(function* () {
     const fs = yield* FileSystem.FileSystem;
     const path = yield* Path.Path;
@@ -790,6 +790,9 @@ it.effect("lists nothing, opens nothing and keeps no index while the setting is 
       .hydrate({ providerInstanceId: claude, filePath })
       .pipe(Effect.flip);
     expect(refused).toMatchObject({ _tag: "AgentSessionHydrateError", reason: "disabled" });
+    expect(yield* harness.catalog.importRecent({ activeFrom: "2026-01-01T00:00:00.000Z" })).toEqual(
+      { importedCount: 0, skippedCount: 0 },
+    );
     expect(harness.imports).toEqual([]);
     expect(yield* fs.exists(path.join(harness.stateDir, "agent-session-catalog.sqlite"))).toBe(
       false,
@@ -858,6 +861,146 @@ it.effect("banishes sessions by age or by choice into the archive, and restores 
     ]);
     expect((yield* harness.catalog.banished({})).totalCount).toBe(0);
   }).pipe(Effect.scoped, Effect.provide(Layer.merge(persistence, NodeServices.layer))),
+);
+
+it.effect(
+  "imports the sessions listed for the last 30 days as settled threads, and nothing else",
+  () =>
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const harness = yield* makeHarness({ realImporter: true });
+      const app = yield* harness.makeWorkspace("app");
+      // A folder no project holds yet; importing its session makes one.
+      const lib = yield* harness.makeWorkspace("lib");
+      const write = (index: number, cwd: string, request: string, ageDays: number) =>
+        harness.writeClaude({
+          cwd,
+          sessionId: `0b6f1d5e-9999-4aaa-8bbb-00000000000${index}`,
+          request,
+          ageDays,
+        });
+      yield* write(1, app, "Yesterday", 1);
+      yield* write(2, lib, "Three weeks ago", 21);
+      yield* write(7, lib, "Two weeks ago", 14);
+      yield* write(3, app, "Six weeks ago", 42);
+      const banished = yield* write(4, app, "Banished last week", 5);
+      const opened = yield* write(5, app, "Opened earlier", 10);
+      const deleted = yield* write(6, app, "Deleted since", 3);
+      yield* harness.catalog.index;
+      yield* harness.catalog.banish({
+        kind: "sessions",
+        sessions: [{ providerInstanceId: claude, filePath: banished }],
+      });
+      const held = yield* harness.catalog.hydrate({ providerInstanceId: claude, filePath: opened });
+      yield* fs.remove(deleted);
+
+      const activeFrom = DateTime.formatIso(DateTime.makeUnsafe(nowMs - 30 * DAY_MS));
+      const result = yield* harness.catalog.importRecent({ activeFrom });
+
+      // The three listed sessions inside the window become threads; the deleted one is skipped.
+      expect(result).toEqual({ importedCount: 3, skippedCount: 1 });
+      for (const index of [1, 2, 7]) {
+        const threadId = ThreadId.make(
+          `import:${claude}:0b6f1d5e-9999-4aaa-8bbb-00000000000${index}`,
+        );
+        const records = yield* harness.projections.getThreadRecords(threadId, ["messages"]);
+        // Settled, as the onboarding import makes them: history to look back on, not open work.
+        expect(records.thread.settledOverride).toBe("settled");
+      }
+      // `app` got its project when a session was opened; `lib` gets exactly one for its two.
+      expect(harness.bootstraps.map((bootstrap) => bootstrap.workspaceRoot).toSorted()).toEqual(
+        [app, lib].toSorted(),
+      );
+      // The session opened earlier stays active and is not imported again.
+      const heldRecords = yield* harness.projections.getThreadRecords(held.threadId, []);
+      expect(heldRecords.thread.settledOverride).toBe("active");
+      // What is left listed is outside the window, and the banished session stays banished.
+      expect(titles(yield* harness.catalog.list({}))).toEqual(["Six weeks ago"]);
+      expect((yield* harness.catalog.banished({})).entries.map((entry) => entry.title)).toEqual([
+        "Banished last week",
+      ]);
+
+      // A second import finds nothing left to take.
+      expect(yield* harness.catalog.importRecent({ activeFrom })).toEqual({
+        importedCount: 0,
+        skippedCount: 0,
+      });
+    }).pipe(Effect.scoped, Effect.provide(Layer.merge(persistence, NodeServices.layer))),
+);
+
+it.effect(
+  "imports more recent sessions than one importer call takes, and counts only real skips",
+  () =>
+    Effect.gen(function* () {
+      const harness = yield* makeHarness({ realImporter: true });
+      const app = yield* harness.makeWorkspace("app");
+      const sessions = AgentSessionScanner.MAX_IMPORT_TRANSCRIPTS + 1;
+      for (let index = 0; index < sessions; index++) {
+        yield* harness.writeClaude({
+          cwd: app,
+          sessionId: `0b6f1d5e-aaaa-4aaa-8bbb-${String(index).padStart(12, "0")}`,
+          request: `Session ${index}`,
+          ageDays: 1 + index / 100,
+        });
+      }
+      // Claude cannot resume a session without a proper id, so the importer skips it.
+      yield* harness.writeClaude({
+        cwd: app,
+        sessionId: "not-a-session-id",
+        request: "Cannot resume",
+        ageDays: 1.5,
+      });
+      yield* harness.catalog.index;
+      expect((yield* harness.catalog.list({ limit: 0 })).totalCount).toBe(sessions + 1);
+
+      const activeFrom = DateTime.formatIso(DateTime.makeUnsafe(nowMs - 30 * DAY_MS));
+      expect(yield* harness.catalog.importRecent({ activeFrom })).toEqual({
+        importedCount: sessions,
+        skippedCount: 1,
+      });
+      expect(titles(yield* harness.catalog.list({}))).toEqual(["Cannot resume"]);
+    }).pipe(Effect.scoped, Effect.provide(Layer.merge(persistence, NodeServices.layer))),
+);
+
+it.effect(
+  "goes through again only the sessions a batch skipped, not ones it imported that moved on",
+  () =>
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      // Set once the sessions are written: the second write transaction of the import, which
+      // comes after the first session's thread is committed, adds a message to that session.
+      let duringImport: Effect.Effect<void> = Effect.void;
+      const harness = yield* makeHarness({
+        realImporter: true,
+        beforeImportTransaction: Effect.suspend(() => duringImport),
+      });
+      const app = yield* harness.makeWorkspace("app");
+      const write = (sessionId: string, request: string, ageDays: number) =>
+        harness.writeClaude({ cwd: app, sessionId, request, ageDays });
+      const first = yield* write("0b6f1d5e-bbbb-4aaa-8bbb-000000000001", "First", 1);
+      yield* write("0b6f1d5e-bbbb-4aaa-8bbb-000000000002", "Second", 2);
+      // Claude cannot resume a session without a proper id, so the importer skips it.
+      yield* write("not-a-session-id", "Cannot resume", 3);
+      yield* harness.catalog.index;
+      let transactions = 0;
+      duringImport = Effect.suspend(() => {
+        transactions += 1;
+        return transactions === 2
+          ? fs.writeFileString(
+              first,
+              claudeTranscript(app, "0b6f1d5e-bbbb-4aaa-8bbb-000000000001", "First") +
+                claudeTranscript(app, "0b6f1d5e-bbbb-4aaa-8bbb-000000000001", "Then more"),
+            )
+          : Effect.void;
+      }).pipe(Effect.orDie);
+
+      const activeFrom = DateTime.formatIso(DateTime.makeUnsafe(nowMs - 30 * DAY_MS));
+      expect(yield* harness.catalog.importRecent({ activeFrom })).toEqual({
+        importedCount: 2,
+        skippedCount: 1,
+      });
+      expect(transactions).toBeGreaterThanOrEqual(2);
+    }).pipe(Effect.scoped, Effect.provide(Layer.merge(persistence, NodeServices.layer))),
 );
 
 it.effect("an age banish from a project scope takes only that scope's sessions", () =>

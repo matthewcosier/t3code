@@ -25,7 +25,6 @@ export function LabsSettingsPanel() {
         <PromptSuggestionsRow />
         <SimlockHostsRow />
         <FastWorktreeCheckoutRow />
-        <ExternalSessionsRow />
       </SettingsSection>
     </SettingsPageContainer>
   );
@@ -162,27 +161,6 @@ function LinkedEnvironmentsRow() {
             updateSettings({ linkedEnvironmentsEnabled: Boolean(checked) })
           }
           aria-label="Linked environments"
-        />
-      }
-    />
-  );
-}
-
-function ExternalSessionsRow() {
-  const settings = useScopedSettings();
-  const updateSettings = useUpdateScopedSettings();
-  return (
-    <SettingsRow
-      serverScoped
-      {...searchableSetting("external-sessions")}
-      settingKeys={["externalSessions"]}
-      description="Show Claude Code, Codex and Pi sessions run outside T3 Code on this machine, under External sessions in the sidebar. Opening one makes it an active thread you can continue."
-      control={
-        <ScopedSwitch
-          settingKeys={["externalSessions"]}
-          checked={settings.externalSessions}
-          onCheckedChange={(checked) => updateSettings({ externalSessions: Boolean(checked) })}
-          aria-label="External sessions"
         />
       }
     />

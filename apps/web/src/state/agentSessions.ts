@@ -25,10 +25,10 @@ export const agentSessionCatalog = createEnvironmentRpcQueryAtomFamily(connectio
   label: "environment-data:agent-sessions:catalog",
   tag: WS_METHODS.agentSessionsCatalog,
   // Every mount re-reads: a page shown again after paging or opening a session must not bring
-  // back a session that has left the External shelf.
+  // back a session that has left the list.
   staleTimeMs: 0,
   idleTtlMs: 5 * 60_000,
-  // A first index of a large machine takes a while; the shelf fills in as it goes.
+  // A first index of a large machine takes a while; the list fills in as it goes.
   refreshIntervalMs: 2_000,
   isFinal: (result) => !result.indexing,
 });
@@ -38,7 +38,7 @@ export const agentSessionCatalogPagesKey = (
   inputs: ReadonlyArray<AgentSessionCatalogInput>,
 ) => JSON.stringify({ environmentId, inputs });
 
-/** Every page the External shelf shows, in order; equal page lists reuse one atom. */
+/** Every page the External sessions list shows, in order; equal page lists reuse one atom. */
 export const agentSessionCatalogPages = Atom.family((key: string) => {
   const { environmentId, inputs } = JSON.parse(key) as {
     readonly environmentId: EnvironmentId;
@@ -55,21 +55,27 @@ export const agentSessionHydrate = createEnvironmentRpcCommand(connectionAtomRun
 });
 
 /**
- * Bumped each time sessions are banished or restored, so the External shelf and the archive,
- * which can be on screen at once, both read again.
+ * Bumped each time sessions are banished or restored, so the list and the banished sessions,
+ * which are on screen together, both read again.
  */
 export const agentSessionBanishVersion = Atom.make(0).pipe(
   Atom.keepAlive,
   Atom.withLabel("environment-data:agent-sessions:banish-version"),
 );
 
-/** Banished sessions still on disk, for the archive. */
+/** Banished sessions still on disk, listed below the sessions they left. */
 export const agentSessionBanished = createEnvironmentRpcQueryAtomFamily(connectionAtomRuntime, {
   label: "environment-data:agent-sessions:banished",
   tag: WS_METHODS.agentSessionsBanished,
   staleTimeMs: 0,
   idleTtlMs: 5 * 60_000,
   refreshTrigger: () => agentSessionBanishVersion,
+});
+
+/** Imports every listed session since a time as a settled thread. */
+export const agentSessionImportRecent = createEnvironmentRpcCommand(connectionAtomRuntime, {
+  label: "environment-data:agent-sessions:import-recent",
+  tag: WS_METHODS.agentSessionsImportRecent,
 });
 
 export const agentSessionBanish = createEnvironmentRpcCommand(connectionAtomRuntime, {

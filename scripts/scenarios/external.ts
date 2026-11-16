@@ -17,10 +17,11 @@ const encodeSettings = Schema.encodeEffect(SettingsJson);
 const DAY_MS = 86_400_000;
 
 /**
- * A project folder outside the T3 home, added through the app's CLI. The External shelf never offers
- * folders inside the T3 home, which is where `t3.project` makes its repositories.
+ * A git folder outside the T3 home that no project holds. External sessions never offers folders
+ * inside the T3 home, which is where `t3.project` makes its repositories. Removing it also removes
+ * a project something made for it since.
  */
-export const outsideProject = Effect.fn("external.outsideProject")(function* (title: string) {
+export const outsideFolder = Effect.fn("external.outsideFolder")(function* (title: string) {
   const fs = yield* FileSystem.FileSystem;
   const path = yield* Path.Path;
   const parent = yield* fs.realPath(yield* fs.makeTempDirectory({ prefix: "t3-external-" }));
@@ -33,13 +34,21 @@ export const outsideProject = Effect.fn("external.outsideProject")(function* (ti
   yield* git(["add", "--all"]);
   yield* git([...author, "commit", "--quiet", "--message", "Initial commit"]);
   const { cli } = makeState(T3_HOME);
-  yield* cli(["project", "add", workspace, "--title", title]);
   return {
     workspace,
+    addProject: cli(["project", "add", workspace, "--title", title]),
     remove: cli(["project", "remove", workspace, "--force"]).pipe(
+      Effect.ignore,
       Effect.andThen(fs.remove(parent, { recursive: true, force: true })),
     ),
   };
+});
+
+/** A project folder outside the T3 home, added through the app's CLI. */
+export const outsideProject = Effect.fn("external.outsideProject")(function* (title: string) {
+  const folder = yield* outsideFolder(title);
+  yield* folder.addProject;
+  return folder;
 });
 
 /**

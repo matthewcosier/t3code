@@ -87,7 +87,8 @@ const MAX_IMPORTED_TRANSCRIPT_BYTES = 4 * 1024 * 1024 * 1024;
 const MAX_IMPORTED_MESSAGES = 200;
 const MAX_IMPORT_HISTORY_BYTES = 32 * 1024 * 1024;
 const MAX_IMPORT_BYTES = 4 * 1024 * 1024 * 1024;
-const MAX_IMPORT_TRANSCRIPTS = 100;
+/** The most transcripts one import call reads; a larger import is split into calls this size. */
+export const MAX_IMPORT_TRANSCRIPTS = 100;
 const MAX_IMPORT_RECORDS = 100_000;
 // The session catalog lists every transcript, so its walk is bounded only against runaway trees.
 const MAX_CATALOG_DISCOVERY_OPERATIONS_PER_SOURCE = 1_000_000;

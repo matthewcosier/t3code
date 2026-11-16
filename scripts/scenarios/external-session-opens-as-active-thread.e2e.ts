@@ -14,6 +14,7 @@ const LATER_REQUEST = "Rename the payout job";
 const RETURN_REQUEST = "Archive the old ledgers";
 /** Over a year old, one more than a group's first page of ten. */
 const OLDER_SESSIONS = 11;
+const PAGE = "/settings/external-sessions";
 
 /**
  * Sessions run outside T3 Code in the project's folder: one from days ago whose transcript is later
@@ -53,7 +54,7 @@ const writeSessions = Effect.fn("external.writeSessions")(function* (workspace: 
 });
 
 test(
-  "A Claude Code session run outside T3 Code opens from the External shelf as an active thread",
+  "A Claude Code session run outside T3 Code opens from Settings as an active thread",
   WEB,
   async ({ t3, app, browser, screen }) => {
     const project = await runPromise(outsideProject("billing"));
@@ -61,35 +62,33 @@ test(
     const settings = await runPromise(externalSettings(sessions.home));
     await runPromise(settings.enable);
     try {
-      await t3.open();
-
-      // Given the External shelf opens on the recent sessions, with older groups closed.
-      await screen.getByTestId("sidebar-external-shelf-toggle").tap();
-      const externalRows = screen.getByTestId("sidebar-external-row");
+      // Given External sessions opens on the recent sessions, with older groups closed.
+      await t3.open(PAGE);
+      const externalRows = screen.getByTestId("external-session-row");
       const oldRow = externalRows.filter({ hasText: OLD_REQUEST });
       const goneRow = externalRows.filter({ hasText: GONE_REQUEST });
       await expect(goneRow).toBeVisible({ timeout: 60_000 });
       await expect(externalRows).toHaveCount(1);
       // When the Older group is opened, it lists its first ten,
-      await screen.getByRole("button", /^Older,/).tap();
+      const older = screen.getByRole("button", /^Older,/);
+      await older.tap();
       await expect(oldRow).toBeVisible({ timeout: 30_000 });
       await expect(externalRows).toHaveCount(11);
       // and the rest of a group is a "Show more" away.
-      await screen.getByTestId("sidebar-external-more").tap();
+      await screen.getByTestId("external-sessions-more").tap();
       await expect(externalRows).toHaveCount(2 + OLDER_SESSIONS);
-      await expect(screen.getByTestId("sidebar-external-more")).toHaveCount(0);
+      await expect(screen.getByTestId("external-sessions-more")).toHaveCount(0);
       await atRest(browser);
       await app.screenshot("external-lists-sessions");
 
-      // When the year-old one is opened from the paged group, with another row pressed straight
-      // after it, only the first opens: it becomes an active thread holding its conversation.
+      // When the year-old one is opened from the paged group, with another row's Open pressed
+      // straight after it, only the first opens: it becomes an active thread holding its
+      // conversation.
       const otherRow = externalRows.filter({ hasText: "Older session 2" });
       await browser.evaluate(
         (titles: ReadonlyArray<string>) => {
-          const rows = [...document.querySelectorAll('[data-testid="sidebar-external-row"]')];
           for (const title of titles) {
-            const row = rows.find((candidate) => candidate.textContent?.includes(title));
-            if (row instanceof HTMLElement) row.click();
+            document.querySelector<HTMLElement>(`[aria-label="Open ${title}"]`)?.click();
           }
           return true;
         },
@@ -99,37 +98,44 @@ test(
       await expect(screen.getByText(OLD_REPLY)).toBeVisible({ timeout: 30_000 });
       const activeRow = screen.getByTestId("sidebar-row-card").filter({ hasText: OLD_REQUEST });
       await expect(activeRow).toBeVisible();
-      await expect(oldRow).toHaveCount(0);
       await screen.getByText(OLD_REPLY).hover();
       await atRest(browser);
       await app.screenshot("opened-as-active-thread");
 
-      // And closing and reopening the shelf never brings it back, not even for one request: a watcher
-      // in the page records every change from here.
+      // And going back to the page never brings it back, not even for one request: a watcher in
+      // the page records every change from here.
       await browser.evaluate(
         (watch: { readonly title: string; readonly staleCount: string }) => {
           const flash = { row: false, count: false };
           (window as unknown as { externalFlash: typeof flash }).externalFlash = flash;
           const check = () => {
-            for (const row of document.querySelectorAll('[data-testid="sidebar-external-row"]')) {
+            for (const row of document.querySelectorAll('[data-testid="external-session-row"]')) {
               if (row.textContent?.includes(watch.title)) flash.row = true;
             }
-            const toggle = document.querySelector('[data-testid="sidebar-external-shelf-toggle"]');
-            if (toggle?.textContent?.includes(watch.staleCount)) flash.count = true;
+            for (const group of document.querySelectorAll(
+              '[data-testid="external-sessions-group"]',
+            )) {
+              if (group.getAttribute("aria-label") === watch.staleCount) flash.count = true;
+            }
           };
           new MutationObserver(check).observe(document.body, {
             subtree: true,
             childList: true,
             characterData: true,
+            attributes: true,
           });
           return true;
         },
-        { title: OLD_REQUEST, staleCount: String(2 + OLDER_SESSIONS) },
+        { title: OLD_REQUEST, staleCount: `Older, ${1 + OLDER_SESSIONS} sessions` },
       );
-      const toggle = screen.getByTestId("sidebar-external-shelf-toggle");
-      await toggle.tap();
-      await expect(toggle).toContainText(String(1 + OLDER_SESSIONS), { timeout: 3_000 });
-      await toggle.tap();
+      await browser.evaluate(() => {
+        window.history.back();
+        return true;
+      });
+      await expect(browser).toHaveURL(/\/settings\/external-sessions/, { timeout: 10_000 });
+      await expect(older).toHaveAttribute("aria-label", new RegExp(`^Older, ${OLDER_SESSIONS} `), {
+        timeout: 3_000,
+      });
       await expect(goneRow).toBeVisible();
       await expect(otherRow).toBeVisible();
       await expect(oldRow).toHaveCount(0, { timeout: 3_000 });
@@ -141,17 +147,15 @@ test(
         ),
       ).toEqual({ row: false, count: false });
 
-      // Then it holds after a reload: still active, still off the shelf, and the group opened
-      // earlier is still open.
+      // Then it holds after a reload: still off the list, and the group opened earlier is still
+      // open.
       await browser.reload();
-      await expect(screen.getByText(OLD_REPLY)).toBeVisible({ timeout: 30_000 });
-      await expect(activeRow).toBeVisible();
       await expect(otherRow).toBeVisible({ timeout: 30_000 });
       await expect(oldRow).toHaveCount(0);
 
-      // And a session finished elsewhere while the shelf is open shows up without a reload. The
-      // shelf re-reads each minute while open, and the server walks the homes again once its last
-      // pass is fifteen seconds old.
+      // And a session finished elsewhere while the page is open shows up without a reload. The
+      // page re-reads each minute while in view, and the server walks the homes again once its
+      // last pass is fifteen seconds old.
       await runPromise(
         sessions.writeLater({
           sessionId: "0b6f1d5e-5555-4aaa-8bbb-200000000001",
@@ -162,22 +166,28 @@ test(
         timeout: 120_000,
       });
 
-      // And a session whose transcript was deleted is refused on screen, and leaves the shelf.
+      // And a session whose transcript was deleted is refused on screen, and leaves the list.
       await runPromise(sessions.removeGone);
-      await goneRow.tap();
+      await screen.getByRole("button", `Open ${GONE_REQUEST}`).tap();
       await expect(browser.locator('[data-type="error"] [data-slot="toast-title"]')).toBeVisible({
         timeout: 30_000,
       });
-      await expect(browser).toHaveURL(/0b6f1d5e-5555-4aaa-8bbb-000000000001/);
+      await expect(browser).toHaveURL(/\/settings\/external-sessions/);
       await expect(goneRow).toHaveCount(0, { timeout: 30_000 });
       await atRest(browser);
       await app.screenshot("deleted-session-refused");
 
-      // And one finished elsewhere while the shelf is closed is counted once the window comes back.
-      await toggle.tap();
-      await expect(toggle).toContainText(String(1 + OLDER_SESSIONS));
-      // Lets the closed shelf's own read finish first, so only the return can find the new one.
-      await runPromise(Effect.sleep("3 seconds"));
+      // And one finished elsewhere while the window is hidden is listed once it comes back.
+      const today = screen.getByRole("button", /^Today,/);
+      await expect(today).toHaveAttribute("aria-label", /^Today, 1 /);
+      await browser.evaluate(() => {
+        Object.defineProperty(document, "visibilityState", {
+          configurable: true,
+          get: () => "hidden",
+        });
+        document.dispatchEvent(new Event("visibilitychange"));
+        return true;
+      });
       await runPromise(
         sessions.writeLater({
           sessionId: "0b6f1d5e-5555-4aaa-8bbb-200000000002",
@@ -186,8 +196,15 @@ test(
       );
       // The server walks the homes again only once its last pass is fifteen seconds old.
       await runPromise(Effect.sleep("16 seconds"));
-      await browser.evaluate(() => window.dispatchEvent(new Event("focus")));
-      await expect(toggle).toContainText(String(2 + OLDER_SESSIONS), { timeout: 20_000 });
+      await browser.evaluate(() => {
+        Object.defineProperty(document, "visibilityState", {
+          configurable: true,
+          get: () => "visible",
+        });
+        document.dispatchEvent(new Event("visibilitychange"));
+        return true;
+      });
+      await expect(today).toHaveAttribute("aria-label", /^Today, 2 /, { timeout: 20_000 });
     } finally {
       await runPromise(settings.restore);
       await runPromise(project.remove);

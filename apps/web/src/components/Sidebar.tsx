@@ -275,7 +275,6 @@ import {
   SidebarSectionHeader,
   SidebarSectionPlaceholder,
 } from "./sidebar/SidebarListMarkers";
-import { SidebarExternalShelf } from "./sidebar/SidebarExternalShelf";
 
 function sameSidebarProviderEntries(
   left: ReadonlyMap<string, SidebarProviderEntry>,
@@ -1097,11 +1096,6 @@ export default function Sidebar({ routeReveal }: { routeReveal: SidebarRouteReve
           ),
         );
   const threads = useQuietThreadShells();
-  // A thread made or deleted on this machine's server can move a session into or out of the External shelf.
-  const primaryThreadCount = threads.reduce(
-    (count, thread) => (thread.environmentId === primaryEnvironmentId ? count + 1 : count),
-    0,
-  );
   const promotingDraftThreadKeys = usePromotingDraftThreadKeys();
   const listedThreads =
     promotingDraftThreadKeys.length === 0
@@ -3654,14 +3648,6 @@ export default function Sidebar({ routeReveal }: { routeReveal: SidebarRouteReve
                               : `Show ${Math.min(hiddenSettledCount, SETTLED_TAIL_PAGE_COUNT)} more`}
                         </button>
                       </li>
-                    ) : null}
-                    {primaryEnvironmentId !== null ? (
-                      <SidebarExternalShelf
-                        environmentId={primaryEnvironmentId}
-                        scopedProjectKeys={scopedProjectKeys}
-                        heldThreadCount={primaryThreadCount}
-                        onOpenThread={navigateToThread}
-                      />
                     ) : null}
                   </ul>
                 </SortableContext>

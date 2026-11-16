@@ -57,6 +57,8 @@ export const SETTINGS_DEVICE_ONLY_PATHS: ReadonlySet<string> = new Set([
   // Access picks its environment on the page itself.
   "/settings/access",
   "/settings/about",
+  // External sessions are read on this machine only.
+  "/settings/external-sessions",
 ]);
 
 interface SettingsScopeMenuProps {

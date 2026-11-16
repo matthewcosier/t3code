@@ -176,6 +176,7 @@ const RPC_AGGREGATES = {
   [WS_METHODS.agentSessionsBanish]: "workspace",
   [WS_METHODS.agentSessionsRestore]: "workspace",
   [WS_METHODS.agentSessionsBanished]: "workspace",
+  [WS_METHODS.agentSessionsImportRecent]: "workspace",
   [WS_METHODS.assetsCreateUrl]: "workspace",
   [WS_METHODS.assetsPersistChatAttachments]: "orchestration",
   [WS_METHODS.attachmentsCreateUploadUrl]: "workspace",

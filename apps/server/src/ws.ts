@@ -3031,6 +3031,7 @@ export const layerWsRpc = (
         [WS_METHODS.agentSessionsBanish]: (input) => agentSessionCatalog.banish(input),
         [WS_METHODS.agentSessionsRestore]: (input) => agentSessionCatalog.restore(input),
         [WS_METHODS.agentSessionsBanished]: (input) => agentSessionCatalog.banished(input),
+        [WS_METHODS.agentSessionsImportRecent]: (input) => agentSessionCatalog.importRecent(input),
         [WS_METHODS.assetsCreateUrl]:
           /* Request instrumentation already owns the span; keep this helper in that context. */
           Effect.fnUntraced(function* (input) {

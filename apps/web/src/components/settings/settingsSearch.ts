@@ -39,7 +39,8 @@ export type SettingsPath =
   | "/settings/maintenance"
   | "/settings/labs"
   | "/settings/about"
-  | "/settings/archived";
+  | "/settings/archived"
+  | "/settings/external-sessions";
 
 export type SettingsSearchScope =
   | "environment"
@@ -116,6 +117,7 @@ export const SETTINGS_SECTION_LABELS: Readonly<Record<SettingsPath, string>> = {
   "/settings/about": msg("About"),
   "/settings/voice": msg("Voice"),
   "/settings/archived": msg("Archive"),
+  "/settings/external-sessions": msg("External sessions"),
 };
 
 /** Sidebar order. A group with a hidden heading is set apart on screen by space alone. */
@@ -162,7 +164,13 @@ export const SETTINGS_NAV_GROUPS: ReadonlyArray<{
   {
     heading: msg("More"),
     headingHidden: true,
-    paths: ["/settings/maintenance", "/settings/labs", "/settings/about", "/settings/archived"],
+    paths: [
+      "/settings/maintenance",
+      "/settings/labs",
+      "/settings/about",
+      "/settings/archived",
+      "/settings/external-sessions",
+    ],
   },
 ];
 
@@ -538,15 +546,6 @@ export const SETTINGS_SEARCH_ITEMS = [
     scope: "environment",
     fastWorktreeCheckoutOnly: true,
     searchTerms: ["beta fast worktree checkout clone apfs copy-on-write cache macos speed"],
-  },
-  {
-    id: "external-sessions",
-    title: "External sessions",
-    to: "/settings/labs",
-    scope: "environment",
-    searchTerms: [
-      "beta external history outside terminal import transcripts claude codex pi sessions ghost catalog resume",
-    ],
   },
   {
     id: "voice-transcription-destination",
@@ -1373,6 +1372,15 @@ export const SETTINGS_SEARCH_ITEMS = [
     secretsFeatureOnly: true,
   },
   {
+    id: "external-sessions",
+    title: "Show external sessions",
+    to: "/settings/external-sessions",
+    primaryEnvironmentOnly: true,
+    searchTerms: [
+      "outside terminal import transcripts claude codex pi sessions history banish resume last 30 days",
+    ],
+  },
+  {
     id: "archive",
     title: "Archived threads",
     to: "/settings/archived",
@@ -1408,6 +1416,7 @@ const SETTINGS_CATEGORY_SCOPES: Readonly<Record<SettingsPath, SettingsSearchScop
   "/settings/labs": null,
   "/settings/about": null,
   "/settings/archived": "project-defaults",
+  "/settings/external-sessions": null,
 };
 
 const RENAMED_SETTINGS_PATHS: Readonly<Record<string, SettingsPath>> = {

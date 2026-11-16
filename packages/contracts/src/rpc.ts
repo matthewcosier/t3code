@@ -105,6 +105,8 @@ import {
   AgentSessionImportInput,
   AgentSessionImportProjectChangedError,
   AgentSessionImportProjectNotFoundError,
+  AgentSessionImportRecentInput,
+  AgentSessionImportRecentResult,
   AgentSessionImportResult,
   AgentSessionScanInput,
   AgentSessionScanResult,
@@ -448,6 +450,7 @@ export const WS_METHODS = {
   agentSessionsBanish: "agentSessions.banish",
   agentSessionsRestore: "agentSessions.restore",
   agentSessionsBanished: "agentSessions.banished",
+  agentSessionsImportRecent: "agentSessions.importRecent",
   assetsCreateUrl: "assets.createUrl",
   assetsPersistChatAttachments: "assets.persistChatAttachments",
   attachmentsCreateUploadUrl: "attachments.createUploadUrl",
@@ -1518,6 +1521,12 @@ const WsAgentSessionsBanishedRpc = Rpc.make(WS_METHODS.agentSessionsBanished, {
   error: Schema.Union([AgentSessionScanError, EnvironmentAuthorizationError]),
 });
 
+const WsAgentSessionsImportRecentRpc = Rpc.make(WS_METHODS.agentSessionsImportRecent, {
+  payload: AgentSessionImportRecentInput,
+  success: AgentSessionImportRecentResult,
+  error: Schema.Union([AgentSessionScanError, EnvironmentAuthorizationError]),
+});
+
 const WsAssetsCreateUrlRpc = Rpc.make(WS_METHODS.assetsCreateUrl, {
   payload: AssetCreateUrlInput,
   success: AssetCreateUrlResult,
@@ -2304,6 +2313,7 @@ export const WsRpcGroup = RpcGroup.make(
   WsAgentSessionsBanishRpc,
   WsAgentSessionsRestoreRpc,
   WsAgentSessionsBanishedRpc,
+  WsAgentSessionsImportRecentRpc,
   WsAssetsCreateUrlRpc,
   WsAssetsPersistChatAttachmentsRpc,
   WsAttachmentsCreateUploadUrlRpc,

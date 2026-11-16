@@ -15,6 +15,7 @@ import {
   CalendarClockIcon,
   FileDiffIcon,
   FolderTreeIcon,
+  GhostIcon,
   GitBranchIcon,
   GlobeIcon,
   InfoIcon,
@@ -111,6 +112,7 @@ const SETTINGS_SECTION_ICONS: Readonly<
   "/settings/labs": FlaskConicalIcon,
   "/settings/about": InfoIcon,
   "/settings/archived": ArchiveIcon,
+  "/settings/external-sessions": GhostIcon,
 };
 
 // Detail pages without a nav entry highlight the page that links to them.

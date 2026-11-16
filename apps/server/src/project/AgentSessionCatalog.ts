@@ -22,6 +22,8 @@ import {
   type AgentSessionCatalogResult,
   type AgentSessionHydrateInput,
   type AgentSessionHydrateResult,
+  type AgentSessionImportRecentInput,
+  type AgentSessionImportRecentResult,
   type AgentSessionRef,
   type AgentSessionRestoreInput,
   type AgentSessionRestoreResult,
@@ -184,6 +186,13 @@ export class AgentSessionCatalog extends Context.Service<
       | AgentSessionImportProjectNotFoundError
       | AgentSessionScanError
     >;
+    /**
+     * Imports every listed session last active since `activeFrom` as a settled thread, creating
+     * projects for folders that have none. Sessions that cannot be opened are skipped.
+     */
+    readonly importRecent: (
+      input: AgentSessionImportRecentInput,
+    ) => Effect.Effect<AgentSessionImportRecentResult, AgentSessionScanError>;
     /** Indexes new and changed transcripts now and waits for it; refresh requests do this in the background. */
     readonly index: Effect.Effect<void, AgentSessionScanError>;
     /** Sends sessions to the archive; they leave the External shelf until restored or active again. */
@@ -215,6 +224,7 @@ const make = Effect.gen(function* () {
   const layerScope = yield* Effect.scope;
   const indexLock = yield* Semaphore.make(1);
   const hydrateLock = yield* Semaphore.make(1);
+  const importLock = yield* Semaphore.make(1);
 
   const catalogError = (cause: unknown) =>
     new AgentSessionScanError({ operation: "read-catalog", cause });
@@ -812,20 +822,18 @@ const make = Effect.gen(function* () {
     return { count };
   });
 
-  const hydrateSession = Effect.fn("AgentSessionCatalog.hydrateSession")(function* (
-    input: AgentSessionHydrateInput,
+  /**
+   * The project a catalogued session opens in and its transcript as it is on disk now, creating the
+   * project when its folder has none; or why it cannot be opened. A transcript gone from disk
+   * leaves the catalog.
+   */
+  const prepareSession = Effect.fn("AgentSessionCatalog.prepareSession")(function* (
+    settings: ServerSettingsValue,
+    row: CatalogRow,
   ) {
     const fail = (reason: AgentSessionHydrateError["reason"]) =>
-      new AgentSessionHydrateError({ reason, filePath: input.filePath });
-    const settings = yield* readSettings;
-    if (!settings.externalSessions) return yield* fail("disabled");
-    const row = yield* withDatabase(
-      (db) =>
-        db
-          .prepare("SELECT * FROM transcripts WHERE provider_instance_id = ? AND file_path = ?")
-          .get(input.providerInstanceId, input.filePath) as CatalogRow | undefined,
-    );
-    if (row === undefined || !isAgentSessionSource(row.source)) return yield* fail("not-found");
+      new AgentSessionHydrateError({ reason, filePath: row.file_path });
+    if (!isAgentSessionSource(row.source)) return yield* fail("not-found");
     // A thread bound to a profile that is off could never continue the session.
     if (!enabledInstanceKeys(settings).has(`${row.source}\0${row.provider_instance_id}`)) {
       return yield* fail("provider-disabled");
@@ -869,29 +877,43 @@ const make = Effect.gen(function* () {
         ));
 
     const projectRoots = decodeProjectRoots(row.project_roots ?? "null");
+    const transcript: AgentSessionScanner.AgentSessionTranscriptFile = {
+      source: row.source,
+      providerInstanceId: ProviderInstanceId.make(row.provider_instance_id),
+      homePath: row.home_path,
+      filePath: row.file_path,
+      mtimeMs: Option.match(stats.value.mtime, {
+        onNone: () => row.mtime_ms,
+        onSome: (mtime) => mtime.getTime(),
+      }),
+      size: Number(stats.value.size),
+      projectRoots: Option.getOrUndefined(projectRoots),
+    };
+    return { projectId, transcript };
+  });
+
+  const hydrateSession = Effect.fn("AgentSessionCatalog.hydrateSession")(function* (
+    input: AgentSessionHydrateInput,
+  ) {
+    const fail = (reason: AgentSessionHydrateError["reason"]) =>
+      new AgentSessionHydrateError({ reason, filePath: input.filePath });
+    const settings = yield* readSettings;
+    if (!settings.externalSessions) return yield* fail("disabled");
+    const row = yield* withDatabase(
+      (db) =>
+        db
+          .prepare("SELECT * FROM transcripts WHERE provider_instance_id = ? AND file_path = ?")
+          .get(input.providerInstanceId, input.filePath) as CatalogRow | undefined,
+    );
+    if (row === undefined) return yield* fail("not-found");
+    const { projectId, transcript } = yield* prepareSession(settings, row);
     const result = yield* importer.importRecentAgentThreads(
       { projectId },
-      {
-        chosen: [
-          {
-            source: row.source,
-            providerInstanceId: ProviderInstanceId.make(row.provider_instance_id),
-            homePath: row.home_path,
-            filePath: row.file_path,
-            mtimeMs: Option.match(stats.value.mtime, {
-              onNone: () => row.mtime_ms,
-              onSome: (mtime) => mtime.getTime(),
-            }),
-            size: Number(stats.value.size),
-            projectRoots: Option.getOrUndefined(projectRoots),
-          },
-        ],
-        active: true,
-      },
+      { chosen: [transcript], active: true },
     );
     const threadId = result.threadIds?.[0];
     if (threadId === undefined) return yield* fail("not-importable");
-    // A thread now holds the session, so the shelf no longer lists it.
+    // A thread now holds the session, so the list no longer shows it.
     yield* Effect.sync(listedChanged);
     return { threadId, projectId };
   });
@@ -901,7 +923,99 @@ const make = Effect.gen(function* () {
   const hydrate: AgentSessionCatalog["Service"]["hydrate"] = (input) =>
     hydrateLock.withPermits(1)(hydrateSession(input));
 
-  return AgentSessionCatalog.of({ list, hydrate, index, banish, restore, banished });
+  const importRecent: AgentSessionCatalog["Service"]["importRecent"] = (input) =>
+    importLock.withPermits(1)(
+      Effect.gen(function* () {
+        const settings = yield* readSettings;
+        if (!settings.externalSessions) return { importedCount: 0, skippedCount: 0 };
+        const fromMs = epochMillis(input.activeFrom);
+        // What the list shows now: not held, not banished, last active since `activeFrom`.
+        const placed = yield* placedSessions(settings, input.projectIds);
+        const rows = placed.sessions.flatMap(({ row, banished }) =>
+          banished === null && row.mtime_ms >= fromMs ? [row] : [],
+        );
+        let skippedCount = 0;
+        const byProject = new Map<
+          ProjectId,
+          Array<AgentSessionScanner.AgentSessionTranscriptFile>
+        >();
+        for (const row of rows) {
+          const prepared = yield* prepareSession(settings, row).pipe(
+            Effect.asSome,
+            // Gone from disk, no folder to open, unreadable or its provider off: skipped.
+            Effect.catchTags({ AgentSessionHydrateError: () => Effect.succeedNone }),
+          );
+          if (Option.isNone(prepared)) {
+            skippedCount += 1;
+            continue;
+          }
+          const { projectId, transcript } = prepared.value;
+          const chosen = byProject.get(projectId);
+          if (chosen === undefined) byProject.set(projectId, [transcript]);
+          else chosen.push(transcript);
+        }
+        // Shares the open lock, so an open of the same session finds the thread made here.
+        const importBatch = (
+          projectId: ProjectId,
+          batch: ReadonlyArray<AgentSessionScanner.AgentSessionTranscriptFile>,
+        ) =>
+          hydrateLock
+            .withPermits(1)(importer.importRecentAgentThreads({ projectId }, { chosen: batch }))
+            .pipe(
+              Effect.asSome,
+              // The project was removed or moved since it was found; its sessions stay listed.
+              Effect.catchTags({
+                AgentSessionImportProjectNotFoundError: () => Effect.succeedNone,
+                AgentSessionImportProjectChangedError: () => Effect.succeedNone,
+              }),
+            );
+        let importedCount = 0;
+        for (const [projectId, chosen] of byProject) {
+          // One importer call takes at most its transcript limit, and all of them share one byte
+          // budget; the sessions a batch skips go through again one at a time, so a skip means
+          // that session could not be imported, not that the batch ran out.
+          for (
+            let start = 0;
+            start < chosen.length;
+            start += AgentSessionScanner.MAX_IMPORT_TRANSCRIPTS
+          ) {
+            const batch = chosen.slice(start, start + AgentSessionScanner.MAX_IMPORT_TRANSCRIPTS);
+            const result = yield* importBatch(projectId, batch);
+            if (Option.isNone(result)) {
+              skippedCount += batch.length;
+              continue;
+            }
+            importedCount += result.value.importedCount;
+            if (result.value.skippedCount === 0 || batch.length === 1) {
+              skippedCount += result.value.skippedCount;
+              continue;
+            }
+            // Only the sessions no thread holds yet go through again: one the batch imported may
+            // have moved on since, and would read as a skip.
+            const held = yield* heldSessions;
+            const left = batch.filter(
+              (transcript) =>
+                !held.filePaths.has(transcript.filePath) &&
+                !held.nativeIds.has(transcript.filePath),
+            );
+            for (const transcript of left) {
+              const single = yield* importBatch(projectId, [transcript]);
+              if (Option.isNone(single)) {
+                skippedCount += 1;
+                continue;
+              }
+              importedCount += single.value.importedCount;
+              skippedCount += single.value.skippedCount;
+            }
+          }
+          // Each project's sessions leave the list as soon as they are threads.
+          yield* Effect.sync(listedChanged);
+        }
+        return { importedCount, skippedCount };
+      }),
+    );
+
+  return AgentSessionCatalog.of({ list, hydrate, importRecent, index, banish, restore, banished });
 });
 
 export const layer = Layer.effect(AgentSessionCatalog, make);

@@ -143,7 +143,7 @@ export const AgentSessionCatalogInput = Schema.Struct({
 });
 export type AgentSessionCatalogInput = typeof AgentSessionCatalogInput.Type;
 
-/** The ages the External shelf offers to banish everything older than, in months. */
+/** The ages External sessions offers to banish everything older than, in months. */
 export const AGENT_SESSION_BANISH_MONTHS = [1, 2, 3, 6, 12] as const;
 
 export const AgentSessionCatalogResult = Schema.Struct({
@@ -177,8 +177,9 @@ export const AgentSessionRef = Schema.Struct({
 export type AgentSessionRef = typeof AgentSessionRef.Type;
 
 /**
- * Takes sessions off the External shelf into the archive: chosen ones, or every listed session last
- * active more than `months` ago. A banished session comes back by itself once it sees new activity.
+ * Takes sessions out of the External sessions list into its banished list: chosen ones, or every
+ * listed session last active more than `months` ago. A banished session comes back by itself once
+ * it sees new activity.
  */
 export const AgentSessionBanishInput = Schema.Union([
   Schema.Struct({ kind: Schema.Literal("sessions"), sessions: Schema.Array(AgentSessionRef) }),
@@ -226,6 +227,20 @@ export const AgentSessionBanishedResult = Schema.Struct({
 });
 export type AgentSessionBanishedResult = typeof AgentSessionBanishedResult.Type;
 
+/** Imports every listed session last active at or after `activeFrom` as a settled thread. */
+export const AgentSessionImportRecentInput = Schema.Struct({
+  activeFrom: IsoDateTime,
+  projectIds: Schema.optional(Schema.Array(ProjectId)),
+});
+export type AgentSessionImportRecentInput = typeof AgentSessionImportRecentInput.Type;
+
+export const AgentSessionImportRecentResult = Schema.Struct({
+  importedCount: NonNegativeInt,
+  /** Sessions that could not be imported: gone from disk, no folder to open, or unreadable. */
+  skippedCount: NonNegativeInt,
+});
+export type AgentSessionImportRecentResult = typeof AgentSessionImportRecentResult.Type;
+
 export const AgentSessionHydrateInput = Schema.Struct({
   providerInstanceId: ProviderInstanceId,
   filePath: TrimmedNonEmptyString,
@@ -254,7 +269,7 @@ export class AgentSessionHydrateError extends Schema.TaggedError<AgentSessionHyd
   override get message(): string {
     switch (this.reason) {
       case "disabled":
-        return "External sessions are turned off in Labs settings.";
+        return "External sessions are turned off in Settings.";
       case "not-found":
         return "That session's transcript is no longer on disk.";
       case "provider-disabled":

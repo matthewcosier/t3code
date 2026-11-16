@@ -1,13 +1,11 @@
 import {
   AGENT_SESSION_BANISH_MONTHS,
   AGENT_SESSION_CATALOG_MAX_PAGE_SIZE,
-  ProjectId,
   type AgentSessionCatalogCursor,
   type AgentSessionCatalogEntry,
   type AgentSessionCatalogInput,
   type AgentSessionCatalogResult,
   type AgentSessionSource,
-  type EnvironmentId,
 } from "@t3tools/contracts";
 import * as Cause from "effect/Cause";
 import { AsyncResult } from "effect/reactivity";
@@ -18,23 +16,7 @@ export const EXTERNAL_PAGE_SIZE = 25;
 /** The server's page cap; a bounded page that reaches it may have lost rows past its end. */
 export const EXTERNAL_BOUNDED_PAGE_LIMIT = AGENT_SESSION_CATALOG_MAX_PAGE_SIZE;
 
-/**
- * Which projects the shelf asks the server for. A sidebar scoped to projects shows only their
- * sessions, so a scope with no project on this server shows no shelf at all (null).
- */
-export function externalProjectIds(
-  environmentId: EnvironmentId,
-  scopedProjectKeys: ReadonlySet<string> | null,
-): ReadonlyArray<ProjectId> | undefined | null {
-  if (scopedProjectKeys === null) return undefined;
-  const prefix = `${environmentId}:`;
-  const projectIds = [...scopedProjectKeys].flatMap((key) =>
-    key.startsWith(prefix) ? [ProjectId.make(key.slice(prefix.length))] : [],
-  );
-  return projectIds.length === 0 ? null : projectIds.toSorted();
-}
-
-/** A span of last activity the shelf groups sessions by, newest first. */
+/** A span of last activity the list groups sessions by, newest first. */
 export interface ExternalGroup {
   readonly id: string;
   readonly label: string;
@@ -107,7 +89,7 @@ export function externalOpenGroups(
 
 /**
  * The group open only because nothing recent has sessions, while the person has not chosen for
- * it. The shelf remembers it as opened, so a new session today does not shut the group being read.
+ * it. The list remembers it as opened, so a new session today does not shut the group being read.
  */
 export function externalFallbackGroup(
   groups: ReadonlyArray<ExternalGroup>,
@@ -126,7 +108,7 @@ export function externalFallbackGroup(
  * requests use.
  */
 export function externalShownOpenGroups(
-  view: ExternalShelfView | null,
+  view: ExternalListView | null,
   chosen: Readonly<Record<string, boolean>>,
 ): ReadonlySet<string> {
   if (view === null) return new Set();
@@ -138,16 +120,14 @@ export function externalShownOpenGroups(
 }
 
 /**
- * The fallback group to remember as opened, once the person has seen it open: the shelf is
- * expanded and the first pass has finished, so a collapsed shelf, another scope or a half-read
- * first pass never opens groups for good.
+ * The fallback group to remember as opened, once the person has seen it open: the first pass has
+ * finished, so a half-read first pass never opens groups for good.
  */
 export function externalFallbackToRemember(
-  view: ExternalShelfView | null,
-  expanded: boolean,
+  view: ExternalListView | null,
   chosen: Readonly<Record<string, boolean>>,
 ): string | null {
-  if (!expanded || view === null || view.firstIndex) return null;
+  if (view === null || view.firstIndex) return null;
   return externalFallbackGroup(
     view.groups.map(({ group }) => group),
     view.groups.map(({ count }) => count),
@@ -158,22 +138,20 @@ export function externalFallbackToRemember(
 /** Each group's count in the view on screen, in group order; zero for a group it does not show. */
 export function externalViewCounts(
   groups: ReadonlyArray<ExternalGroup>,
-  view: ExternalShelfView | null,
+  view: ExternalListView | null,
 ): ReadonlyArray<number> {
   return groups.map(
     (group) => view?.groups.find((shown) => shown.group.id === group.id)?.count ?? 0,
   );
 }
 
-type PageScope = Pick<AgentSessionCatalogInput, "projectIds" | "activeFrom" | "activeUntil">;
+type PageScope = Pick<AgentSessionCatalogInput, "activeFrom" | "activeUntil">;
 
 /** The request that counts every group and the banish presets; it alone starts index passes. */
 export function externalSummaryInput(
-  projectIds: ReadonlyArray<ProjectId> | undefined,
   groups: ReadonlyArray<ExternalGroup>,
 ): AgentSessionCatalogInput {
   return {
-    ...(projectIds === undefined ? {} : { projectIds }),
     limit: 0,
     refresh: true,
     groupBounds: groups.flatMap((group, index) =>
@@ -188,13 +166,11 @@ export function externalSummaryInput(
  * row out of view.
  */
 export function externalGroupPageInputs(input: {
-  readonly projectIds: ReadonlyArray<ProjectId> | undefined;
   readonly group: ExternalGroup;
   readonly cursors: ReadonlyArray<AgentSessionCatalogCursor>;
 }): ReadonlyArray<AgentSessionCatalogInput> {
   const { group, cursors } = input;
   const scope: PageScope = {
-    ...(input.projectIds === undefined ? {} : { projectIds: input.projectIds }),
     ...(group.activeFrom === undefined ? {} : { activeFrom: group.activeFrom }),
     ...(group.activeUntil === undefined ? {} : { activeUntil: group.activeUntil }),
   };
@@ -214,8 +190,8 @@ export function externalGroupPageInputs(input: {
   ];
 }
 
-/** Every request the shelf makes, the summary first, and which of them belong to each group. */
-export interface ExternalShelfRequests {
+/** Every request the list makes, the summary first, and which of them belong to each group. */
+export interface ExternalListRequests {
   readonly inputs: ReadonlyArray<AgentSessionCatalogInput>;
   readonly groupPages: ReadonlyArray<{
     readonly groupId: string;
@@ -224,23 +200,19 @@ export interface ExternalShelfRequests {
   }>;
 }
 
-export function externalShelfRequests(input: {
-  readonly projectIds: ReadonlyArray<ProjectId> | undefined;
+export function externalListRequests(input: {
   readonly groups: ReadonlyArray<ExternalGroup>;
-  /** Groups whose rows are read: open groups of an expanded shelf. */
+  /** Groups whose rows are read: the open ones. */
   readonly listed: ReadonlySet<string>;
   readonly cursors: Readonly<Record<string, ReadonlyArray<AgentSessionCatalogCursor>>>;
-}): ExternalShelfRequests {
-  const inputs: Array<AgentSessionCatalogInput> = [
-    externalSummaryInput(input.projectIds, input.groups),
-  ];
+}): ExternalListRequests {
+  const inputs: Array<AgentSessionCatalogInput> = [externalSummaryInput(input.groups)];
   const groupPages: Array<{ groupId: string; start: number; end: number }> = [];
   for (const group of input.groups) {
     if (!input.listed.has(group.id)) continue;
     const start = inputs.length;
     inputs.push(
       ...externalGroupPageInputs({
-        projectIds: input.projectIds,
         group,
         cursors: input.cursors[group.id] ?? [],
       }),
@@ -270,8 +242,8 @@ export interface ExternalGroupView {
   readonly overflowed: boolean;
 }
 
-export interface ExternalShelfView {
-  /** Sessions the shelf could list in all, shown or not. */
+export interface ExternalListView {
+  /** Sessions the list could show in all, shown or not. */
   readonly totalCount: number;
   readonly indexing: boolean;
   /** No index pass has finished yet, so rows still arrive in no particular order. */
@@ -316,12 +288,12 @@ export function externalLaggingPages(
     : answered.map((_, index) => index);
 }
 
-/** The shelf once every request has a current answer and they agree. */
-export function externalShelfView(input: {
+/** The list once every request has a current answer and they agree. */
+export function externalListView(input: {
   readonly groups: ReadonlyArray<ExternalGroup>;
-  readonly requests: ExternalShelfRequests;
+  readonly requests: ExternalListRequests;
   readonly results: ReadonlyArray<AgentSessionCatalogResult | null>;
-}): ExternalShelfView | null {
+}): ExternalListView | null {
   const { groups, requests } = input;
   const results = input.results.flatMap((result) => (result === null ? [] : [result]));
   const summary = results[0];
@@ -399,17 +371,17 @@ export function externalSucceededAnswer<A>(result: AsyncResult.AsyncResult<A, un
   return result._tag === "Success" && !result.waiting ? result.value : null;
 }
 
-/** What the shelf lists: the fresh view, else the last one of this scope while answers load. */
+/** What the list shows: the fresh view, else the last one of this scope while answers load. */
 export function externalShownView(
-  kept: { readonly scopeKey: string; readonly view: ExternalShelfView } | null,
+  kept: { readonly scopeKey: string; readonly view: ExternalListView } | null,
   scopeKey: string,
-  fresh: ExternalShelfView | null,
-): ExternalShelfView | null {
+  fresh: ExternalListView | null,
+): ExternalListView | null {
   return fresh ?? (kept?.scopeKey === scopeKey ? kept.view : null);
 }
 
-/** The shelf's own last row: why it shows nothing, or that it is still reading. */
-export type ExternalShelfStatus = "retry" | "loading" | "reading" | "empty" | null;
+/** The list's own status row: why it shows nothing, or that it is still reading. */
+export type ExternalListStatus = "retry" | "loading" | "reading" | "empty" | null;
 
 /**
  * Whether the rows on screen are about to change: a request has no answer yet, the answers have
@@ -417,23 +389,23 @@ export type ExternalShelfStatus = "retry" | "loading" | "reading" | "empty" | nu
  * other requests (a group just opened or paged). A re-read of the same requests is not: paging
  * from the rows shown is right whichever pass they came from.
  */
-export function externalShelfMoving(input: {
-  readonly fresh: ExternalShelfView | null;
+export function externalListMoving(input: {
+  readonly fresh: ExternalListView | null;
   readonly settled: ReadonlyArray<AgentSessionCatalogResult | null>;
   readonly loading: boolean;
   /** The rows on screen were built from the requests made now. */
   readonly shownCurrent: boolean;
-  /** A read failed: the shelf offers a retry, and nothing is on its way. */
+  /** A read failed: the list offers a retry, and nothing is on its way. */
   readonly failed: boolean;
 }): boolean {
   if (input.fresh !== null || input.failed) return false;
   return input.loading || !input.shownCurrent || input.settled.every((answer) => answer !== null);
 }
 
-export function externalShelfStatus(input: {
-  readonly shown: ExternalShelfView | null;
+export function externalListStatus(input: {
+  readonly shown: ExternalListView | null;
   readonly failed: boolean;
-}): ExternalShelfStatus {
+}): ExternalListStatus {
   const { shown } = input;
   if (input.failed) return "retry";
   // Nothing on screen and nothing failed: something is still on its way.
@@ -452,7 +424,7 @@ export function externalGroupFooter(input: {
   readonly group: ExternalGroupView;
   readonly moving: boolean;
   readonly opening: boolean;
-  /** The shelf offers a retry below; a group waiting on the failed read shows nothing more. */
+  /** The list offers a retry; a group waiting on the failed read shows nothing more. */
   readonly failed: boolean;
 }): ExternalGroupFooter {
   const { group } = input;
@@ -461,7 +433,7 @@ export function externalGroupFooter(input: {
   return { kind: "more", count: group.showMoreCount, busy: input.moving || input.opening };
 }
 
-/** What the shelf last saw of the things that change what it lists from outside it. */
+/** What the list last saw of the things that change what it shows from outside it. */
 export interface ExternalObserved {
   readonly nowMinute: string;
   readonly heldThreadCount: number;
@@ -470,13 +442,13 @@ export interface ExternalObserved {
 
 /**
  * Whether a change since the last look calls for a re-read. A change to the threads held or to
- * what is banished always does; a new minute only while the shelf is open and in view, so a
- * window left in the background does not walk every home once a minute.
+ * what is banished always does; a new minute only while the window is in view, so a window left
+ * in the background does not walk every home once a minute.
  */
 export function externalRefreshDue(
   observed: ExternalObserved,
   current: ExternalObserved,
-  shelf: { readonly expanded: boolean; readonly visible: boolean },
+  visible: boolean,
 ): boolean {
   if (
     observed.heldThreadCount !== current.heldThreadCount ||
@@ -484,7 +456,7 @@ export function externalRefreshDue(
   ) {
     return true;
   }
-  return observed.nowMinute !== current.nowMinute && shelf.expanded && shelf.visible;
+  return observed.nowMinute !== current.nowMinute && visible;
 }
 
 /**
@@ -509,7 +481,7 @@ export function externalCursorsAfterShowMore(
 
 /** A group whose bounded page reached the cap may hide rows, so it pages again from its top. */
 export function externalCursorsAfterAnswer(
-  view: ExternalShelfView | null,
+  view: ExternalListView | null,
   cursors: Readonly<Record<string, ReadonlyArray<AgentSessionCatalogCursor>>>,
 ): Readonly<Record<string, ReadonlyArray<AgentSessionCatalogCursor>>> {
   const reset = (view?.groups ?? []).filter(
@@ -568,29 +540,29 @@ export function externalEntryPlace(entry: AgentSessionCatalogEntry): string {
   return `${SOURCE_NAMES[entry.source]} in ${folderName(entry.cwd ?? entry.projectRoot)}`;
 }
 
+/** The groups "Import the last 30 days" takes, newest first. */
+const IMPORT_GROUPS: ReadonlySet<string> = new Set(["today", "yesterday", "week", "month"]);
+
 /**
- * Where keyboard focus goes when rows are banished from the keyboard: the next row that stays,
- * else the one before it, so a second Delete carries on down the list.
+ * What "Import the last 30 days" takes: every session listed since the "Previous 30 days" group
+ * starts, so the count on the button and what the server imports cover the same days.
  */
-export function externalFocusAfterBanish(
-  orderedKeys: ReadonlyArray<string>,
-  leaving: ReadonlySet<string>,
-  fromKey: string,
-): string | null {
-  const index = orderedKeys.indexOf(fromKey);
-  const after = orderedKeys.slice(index + 1).find((key) => !leaving.has(key));
-  if (after !== undefined) return after;
-  return (
-    orderedKeys
-      .slice(0, Math.max(index, 0))
-      .toReversed()
-      .find((key) => !leaving.has(key)) ?? null
+export function externalImportWindow(
+  groups: ReadonlyArray<ExternalGroup>,
+  view: ExternalListView | null,
+): { readonly activeFrom: string; readonly count: number } | null {
+  const activeFrom = groups.find((group) => group.id === "month")?.activeFrom;
+  if (activeFrom === undefined || view === null) return null;
+  const count = view.groups.reduce(
+    (sum, shown) => (IMPORT_GROUPS.has(shown.group.id) ? sum + shown.count : sum),
+    0,
   );
+  return { activeFrom, count };
 }
 
 /** The banish menu: each age preset with how many listed sessions it would take. */
 export function externalBanishPresets(
-  view: ExternalShelfView | null,
+  view: ExternalListView | null,
 ): ReadonlyArray<{ readonly months: number; readonly label: string; readonly count: number }> {
   return AGENT_SESSION_BANISH_MONTHS.map((months) => ({
     months,
@@ -608,15 +580,14 @@ export interface ExternalSelection {
 export const NO_EXTERNAL_SELECTION: ExternalSelection = { keys: new Set(), anchor: null };
 
 /**
- * Cmd or Ctrl toggles one row; Shift selects every row between the anchor and this one, in the
- * order shown. A plain click is an open, not a selection.
+ * A row's checkbox toggles that row; with Shift it selects every row between the anchor and this
+ * one, in the order shown.
  */
 export function externalSelectionAfterClick(
   selection: ExternalSelection,
   click: {
     readonly key: string;
     readonly orderedKeys: ReadonlyArray<string>;
-    readonly toggle: boolean;
     readonly range: boolean;
   },
 ): ExternalSelection {
@@ -635,17 +606,6 @@ export function externalSelectionAfterClick(
   if (keys.has(click.key)) keys.delete(click.key);
   else keys.add(click.key);
   return { keys, anchor: click.key };
-}
-
-/** A banish from a selected row takes the whole selection; from any other row, just that row. */
-export function externalBanishTargets(
-  selection: ExternalSelection,
-  entries: ReadonlyArray<AgentSessionCatalogEntry>,
-  from: AgentSessionCatalogEntry,
-): ReadonlyArray<AgentSessionCatalogEntry> {
-  const fromKey = externalEntryKey(from);
-  if (!selection.keys.has(fromKey)) return [from];
-  return entries.filter((entry) => selection.keys.has(externalEntryKey(entry)));
 }
 
 /** The server's own reason when it refused the open, else a plain failure. */

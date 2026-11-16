@@ -1,7 +1,5 @@
 import {
   AgentSessionHydrateError,
-  EnvironmentId,
-  ProjectId,
   ProviderInstanceId,
   type AgentSessionCatalogEntry,
   type AgentSessionCatalogResult,
@@ -18,7 +16,6 @@ import {
   NO_EXTERNAL_SELECTION,
   createExternalOpenGate,
   externalBanishPresets,
-  externalBanishTargets,
   externalCursorAfter,
   externalCursorsAfterAnswer,
   externalCursorsAfterShowMore,
@@ -26,31 +23,28 @@ import {
   externalEntryTitle,
   externalFallbackGroup,
   externalFallbackToRemember,
-  externalFocusAfterBanish,
   externalGroupFooter,
   externalGroupPageInputs,
   externalGroups,
+  externalImportWindow,
   externalLaggingPages,
   externalOpenFailureMessage,
   externalOpenGroups,
-  externalProjectIds,
   externalRefreshDue,
   externalSelectionAfterClick,
   externalSettledAnswer,
-  externalShelfMoving,
-  externalShelfRequests,
-  externalShelfStatus,
-  externalShelfView,
+  externalListMoving,
+  externalListRequests,
+  externalListStatus,
+  externalListView,
   externalShownOpenGroups,
   externalShownView,
   externalSucceededAnswer,
   externalSummaryInput,
   externalViewCounts,
   type ExternalGroup,
-} from "./externalShelf.logic";
+} from "./externalSessions.logic";
 
-const local = EnvironmentId.make("env-local");
-const remote = EnvironmentId.make("env-remote");
 const claude = ProviderInstanceId.make("claudeAgent");
 
 function entry(index: number, overrides: Partial<AgentSessionCatalogEntry> = {}) {
@@ -87,24 +81,6 @@ function page(
 
 const range = (from: number, count: number) =>
   Array.from({ length: count }, (_, offset) => entry(from + offset));
-
-describe("externalProjectIds", () => {
-  it("asks for every session when the sidebar shows every project", () => {
-    expect(externalProjectIds(local, null)).toBeUndefined();
-  });
-
-  it("asks only for this server's scoped projects", () => {
-    const scoped = new Set([`${local}:project-b`, `${remote}:project-c`, `${local}:project-a`]);
-    expect(externalProjectIds(local, scoped)).toEqual([
-      ProjectId.make("project-a"),
-      ProjectId.make("project-b"),
-    ]);
-  });
-
-  it("shows no shelf when the scope has no project on this server", () => {
-    expect(externalProjectIds(local, new Set([`${remote}:project-c`]))).toBeNull();
-  });
-});
 
 /** Where a moment falls: the id of the one group whose span holds it. */
 const groupOf = (groups: ReadonlyArray<ExternalGroup>, iso: string) =>
@@ -190,7 +166,7 @@ describe("requests", () => {
   const week = groups.find((group) => group.id === "week")!;
 
   it("counts every group in one summary that alone picks up new sessions", () => {
-    const summary = externalSummaryInput(undefined, groups);
+    const summary = externalSummaryInput(groups);
     expect(summary.limit).toBe(0);
     expect(summary.refresh).toBe(true);
     // A bound where each group but the oldest starts.
@@ -198,7 +174,7 @@ describe("requests", () => {
   });
 
   it("reads one short first page of a group's span, without starting a pass", () => {
-    expect(externalGroupPageInputs({ projectIds: undefined, group: week, cursors: [] })).toEqual([
+    expect(externalGroupPageInputs({ group: week, cursors: [] })).toEqual([
       {
         activeFrom: week.activeFrom,
         activeUntil: week.activeUntil,
@@ -210,7 +186,7 @@ describe("requests", () => {
   it("bounds every page of a group but the last at the row it ended on", () => {
     const cursors = [externalCursorAfter(entry(9)), externalCursorAfter(entry(34))];
     const span = { activeFrom: week.activeFrom, activeUntil: week.activeUntil };
-    expect(externalGroupPageInputs({ projectIds: undefined, group: week, cursors })).toEqual([
+    expect(externalGroupPageInputs({ group: week, cursors })).toEqual([
       { ...span, through: cursors[0], limit: EXTERNAL_BOUNDED_PAGE_LIMIT },
       { ...span, before: cursors[0], through: cursors[1], limit: EXTERNAL_BOUNDED_PAGE_LIMIT },
       { ...span, before: cursors[1], limit: EXTERNAL_PAGE_SIZE },
@@ -218,8 +194,7 @@ describe("requests", () => {
   });
 
   it("reads rows only for the groups listed, after the summary", () => {
-    const requests = externalShelfRequests({
-      projectIds: [ProjectId.make("project-a")],
+    const requests = externalListRequests({
       groups,
       listed: new Set(["week", "older"]),
       cursors: { older: [externalCursorAfter(entry(9))] },
@@ -229,11 +204,10 @@ describe("requests", () => {
       { groupId: "week", start: 1, end: 2 },
       { groupId: "older", start: 2, end: 4 },
     ]);
-    expect(requests.inputs.every((input) => input.projectIds?.[0] === "project-a")).toBe(true);
   });
 });
 
-describe("externalShelfView", () => {
+describe("externalListView", () => {
   const groups = externalGroups(NOW);
   const index = (id: string) => groups.findIndex((group) => group.id === id);
   const counts = (byGroup: Record<string, number>) => groups.map((group) => byGroup[group.id] ?? 0);
@@ -249,11 +223,11 @@ describe("externalShelfView", () => {
     });
   };
   const listing = (listed: ReadonlyArray<string>, cursors = {}) =>
-    externalShelfRequests({ projectIds: undefined, groups, listed: new Set(listed), cursors });
+    externalListRequests({ groups, listed: new Set(listed), cursors });
 
   it("lists each open group's rows under it, and only counts for the closed and the empty", () => {
     const requests = listing(["week"]);
-    const view = externalShelfView({
+    const view = externalListView({
       groups,
       requests,
       results: [summary({ week: 3, older: 40 }), page(range(0, 3), { totalCount: 3 })],
@@ -270,7 +244,7 @@ describe("externalShelfView", () => {
   });
 
   it("offers more in a group while its last page came back full, and none once short", () => {
-    const full = externalShelfView({
+    const full = externalListView({
       groups,
       requests: listing(["older"]),
       results: [summary({ older: 40 }), page(range(0, 10), { totalCount: 40 })],
@@ -279,7 +253,7 @@ describe("externalShelfView", () => {
     expect(externalCursorsAfterShowMore(full.groups[0]!, [])).toEqual([
       externalCursorAfter(entry(9)),
     ]);
-    const short = externalShelfView({
+    const short = externalListView({
       groups,
       requests: listing(["older"]),
       // The total says more, but the page came back short: the group has no more to show.
@@ -293,7 +267,7 @@ describe("externalShelfView", () => {
   it("does not join answers read from different revisions of the catalog", () => {
     const requests = listing(["week"]);
     expect(
-      externalShelfView({
+      externalListView({
         groups,
         requests,
         results: [summary({ week: 3 }, { revision: 2 }), page(range(0, 3))],
@@ -305,7 +279,7 @@ describe("externalShelfView", () => {
     // Another window opened a session between the two reads: the rows are the same revision, but
     // the threads holding sessions are not.
     expect(
-      externalShelfView({
+      externalListView({
         groups,
         requests: listing(["week"]),
         results: [summary({ week: 2 }, { listing: "b" }), page(range(0, 3))],
@@ -314,8 +288,8 @@ describe("externalShelfView", () => {
   });
 
   it("joins answers taken while a pass runs, when they were read from the same revision", () => {
-    // Expanding the shelf, banishing or opening starts a pass; the rows it already has stand.
-    const view = externalShelfView({
+    // Coming back to the page, banishing or opening starts a pass; the rows it already has stand.
+    const view = externalListView({
       groups,
       requests: listing(["week"]),
       results: [summary({ week: 3 }, { indexing: true }), page(range(0, 3), { indexing: true })],
@@ -325,7 +299,7 @@ describe("externalShelfView", () => {
 
   it("fills in as the first pass goes, without offering more until it has finished", () => {
     const first = { indexedAt: null, indexing: true };
-    const view = externalShelfView({
+    const view = externalListView({
       groups,
       requests: listing(["older"]),
       results: [summary({ older: 40 }, first), page(range(0, 10), { ...first, totalCount: 12 })],
@@ -336,7 +310,7 @@ describe("externalShelfView", () => {
   });
 
   it("lists a session once even if two groups both return it", () => {
-    const view = externalShelfView({
+    const view = externalListView({
       groups,
       requests: listing(["week", "month"]),
       results: [summary({ week: 2, month: 2 }), page(range(0, 2)), page(range(1, 2))],
@@ -347,14 +321,14 @@ describe("externalShelfView", () => {
   it("has no view until every request has a current answer", () => {
     const requests = listing(["week"]);
     expect(
-      externalShelfView({ groups, requests, results: [summary({ week: 3 }), null] }),
+      externalListView({ groups, requests, results: [summary({ week: 3 }), null] }),
     ).toBeNull();
-    expect(externalShelfView({ groups, requests, results: [null, page(range(0, 3))] })).toBeNull();
+    expect(externalListView({ groups, requests, results: [null, page(range(0, 3))] })).toBeNull();
   });
 
   it("starts a group again from its first page when one of its bounded pages reaches the cap", () => {
     const cursors = { older: [externalCursorAfter(entry(9))] };
-    const capped = externalShelfView({
+    const capped = externalListView({
       groups,
       requests: listing(["week", "older"], cursors),
       results: [
@@ -365,7 +339,7 @@ describe("externalShelfView", () => {
       ],
     });
     expect(externalCursorsAfterAnswer(capped, cursors)).toEqual({});
-    const fine = externalShelfView({
+    const fine = externalListView({
       groups,
       requests: listing(["older"], cursors),
       results: [summary({ older: 13 }), page(range(0, 10)), page(range(10, 3))],
@@ -374,7 +348,7 @@ describe("externalShelfView", () => {
   });
 
   it("keeps the rows on screen while a re-read loads, never another scope's", () => {
-    const view = externalShelfView({
+    const view = externalListView({
       groups,
       requests: listing(["week"]),
       results: [summary({ week: 3 }), page(range(0, 3))],
@@ -413,9 +387,9 @@ describe("externalLaggingPages", () => {
     });
     const results = [AsyncResult.success(page([], { revision: 2 })), failedPage];
     expect(externalLaggingPages(results.map(externalSucceededAnswer))).toEqual([]);
-    // The shelf offers a retry instead, with nothing shown as on its way.
+    // The list offers a retry instead, with nothing shown as on its way.
     expect(
-      externalShelfMoving({
+      externalListMoving({
         fresh: null,
         settled: results.map(externalSettledAnswer),
         loading: false,
@@ -448,18 +422,16 @@ describe("externalSettledAnswer", () => {
 
 describe("status", () => {
   const groups = externalGroups(NOW);
-  const requests = externalShelfRequests({
-    projectIds: undefined,
+  const requests = externalListRequests({
     groups,
     listed: new Set(["older"]),
     cursors: { older: [externalCursorAfter(entry(9))] },
   });
   const olderCounts = groups.map((group) => (group.id === "older" ? 40 : 0));
   const summary = page([], { totalCount: 40, groupCounts: olderCounts });
-  const shown = externalShelfView({
+  const shown = externalListView({
     groups,
-    requests: externalShelfRequests({
-      projectIds: undefined,
+    requests: externalListRequests({
       groups,
       listed: new Set(["older"]),
       cursors: {},
@@ -472,9 +444,9 @@ describe("status", () => {
   it("holds Show more while answers that all arrived still disagree", () => {
     // A pass found a new session: the summary answered from the newer revision, the pages not yet.
     const settled = [{ ...summary, revision: 2 }, page(range(0, 10)), page(range(10, 25))];
-    const fresh = externalShelfView({ groups, requests, results: settled });
+    const fresh = externalListView({ groups, requests, results: settled });
     expect(fresh).toBeNull();
-    const moving = externalShelfMoving({
+    const moving = externalListMoving({
       fresh,
       settled,
       loading: false,
@@ -493,7 +465,7 @@ describe("status", () => {
     // "Show more" was just pressed: the rows shown are from before, the new page has no answer.
     const settled = [summary, null, null];
     expect(
-      externalShelfMoving({
+      externalListMoving({
         fresh: null,
         settled,
         loading: false,
@@ -508,7 +480,7 @@ describe("status", () => {
     // same requests does not hold it, and the button does not flicker each minute.
     const settled = [summary, null, page(range(10, 25))];
     expect(
-      externalShelfMoving({
+      externalListMoving({
         fresh: null,
         settled,
         loading: false,
@@ -517,7 +489,7 @@ describe("status", () => {
       }),
     ).toBe(false);
     expect(
-      externalShelfMoving({
+      externalListMoving({
         fresh: shown,
         settled: [],
         loading: false,
@@ -541,23 +513,23 @@ describe("status", () => {
   it("shows a group just opened as loading until its rows arrive, unless the read failed", () => {
     const closed = { ...olderGroup, entries: null };
     expect(externalGroupFooter({ ...idle, group: closed })).toEqual({ kind: "loading" });
-    // The shelf's retry row stands for it; the group shows no spinner above it.
+    // The list's retry row stands for it; the group shows no spinner above it.
     expect(externalGroupFooter({ ...idle, failed: true, group: closed })).toBeNull();
   });
 
-  it("says why the shelf shows nothing: failed, on its way, still reading, or no sessions", () => {
-    expect(externalShelfStatus({ shown: null, failed: true })).toBe("retry");
-    expect(externalShelfStatus({ shown: null, failed: false })).toBe("loading");
+  it("says why the list shows nothing: failed, on its way, still reading, or no sessions", () => {
+    expect(externalListStatus({ shown: null, failed: true })).toBe("retry");
+    expect(externalListStatus({ shown: null, failed: false })).toBe("loading");
     expect(
-      externalShelfStatus({ shown: { ...shown, firstIndex: true, indexing: true }, failed: false }),
+      externalListStatus({ shown: { ...shown, firstIndex: true, indexing: true }, failed: false }),
     ).toBe("reading");
     expect(
-      externalShelfStatus({
+      externalListStatus({
         shown: { ...shown, totalCount: 0, groups: [], entries: [] },
         failed: false,
       }),
     ).toBe("empty");
-    expect(externalShelfStatus({ shown, failed: false })).toBeNull();
+    expect(externalListStatus({ shown, failed: false })).toBeNull();
   });
 
   it("asks for the page after a row once, however often Show more is pressed before it shows", () => {
@@ -583,20 +555,18 @@ describe("which groups stay open", () => {
   });
 
   it("remembers the fallback group only once the person has seen it open", () => {
-    const view = externalShelfView({
+    const view = externalListView({
       groups,
-      requests: externalShelfRequests({
-        projectIds: undefined,
+      requests: externalListRequests({
         groups,
         listed: new Set(),
         cursors: {},
       }),
       results: [page([], { totalCount: 4, groupCounts: counts({ month: 3, older: 1 }) })],
     });
-    expect(externalFallbackToRemember(view, true, {})).toBe("month");
-    // Not while the shelf is collapsed, nor while the first pass is still reading.
-    expect(externalFallbackToRemember(view, false, {})).toBeNull();
-    expect(externalFallbackToRemember({ ...view!, firstIndex: true }, true, {})).toBeNull();
+    expect(externalFallbackToRemember(view, {})).toBe("month");
+    // Not while the first pass is still reading.
+    expect(externalFallbackToRemember({ ...view!, firstIndex: true }, {})).toBeNull();
   });
 
   it("keeps a month open over the month's end until the new answers land", () => {
@@ -604,10 +574,9 @@ describe("which groups stay open", () => {
     // the rows on screen still hold it, so it stays open with its rows.
     const lastDay = externalGroups("2026-11-30T12:00");
     const oldest = lastDay.filter((group) => group.id.startsWith("month:")).at(-1)!;
-    const view = externalShelfView({
+    const view = externalListView({
       groups: lastDay,
-      requests: externalShelfRequests({
-        projectIds: undefined,
+      requests: externalListRequests({
         groups: lastDay,
         listed: new Set([oldest.id]),
         cursors: {},
@@ -628,10 +597,9 @@ describe("which groups stay open", () => {
   it("keeps a group open while the rows on screen still hold it", () => {
     // The newest counts moved the group's last session to Today, but the answers do not agree
     // yet: the rows on screen still list the group, so it stays open with them.
-    const view = externalShelfView({
+    const view = externalListView({
       groups,
-      requests: externalShelfRequests({
-        projectIds: undefined,
+      requests: externalListRequests({
         groups,
         listed: new Set(["week"]),
         cursors: {},
@@ -646,19 +614,16 @@ describe("which groups stay open", () => {
 describe("externalRefreshDue", () => {
   const before = { nowMinute: "2026-11-16T10:00", heldThreadCount: 4, banishVersion: 0 };
   const nextMinute = { ...before, nowMinute: "2026-11-16T10:01" };
-  const open = { expanded: true, visible: true };
 
-  it("re-reads each minute only while the shelf is open and the window is in view", () => {
-    expect(externalRefreshDue(before, nextMinute, open)).toBe(true);
-    expect(externalRefreshDue(before, nextMinute, { ...open, visible: false })).toBe(false);
-    expect(externalRefreshDue(before, nextMinute, { ...open, expanded: false })).toBe(false);
+  it("re-reads each minute only while the window is in view", () => {
+    expect(externalRefreshDue(before, nextMinute, true)).toBe(true);
+    expect(externalRefreshDue(before, nextMinute, false)).toBe(false);
   });
 
-  it("re-reads whenever the held threads or what is banished change, open or not", () => {
-    const hidden = { expanded: false, visible: false };
-    expect(externalRefreshDue(before, { ...before, heldThreadCount: 5 }, hidden)).toBe(true);
-    expect(externalRefreshDue(before, { ...before, banishVersion: 1 }, hidden)).toBe(true);
-    expect(externalRefreshDue(before, before, open)).toBe(false);
+  it("re-reads whenever the held threads or what is banished change, in view or not", () => {
+    expect(externalRefreshDue(before, { ...before, heldThreadCount: 5 }, false)).toBe(true);
+    expect(externalRefreshDue(before, { ...before, banishVersion: 1 }, false)).toBe(true);
+    expect(externalRefreshDue(before, before, true)).toBe(false);
   });
 });
 
@@ -677,10 +642,9 @@ describe("createExternalOpenGate", () => {
 describe("banishing", () => {
   it("offers each age preset with how many sessions it would take", () => {
     const groups = externalGroups(NOW);
-    const view = externalShelfView({
+    const view = externalListView({
       groups,
-      requests: externalShelfRequests({
-        projectIds: undefined,
+      requests: externalListRequests({
         groups,
         listed: new Set(),
         cursors: {},
@@ -703,52 +667,50 @@ describe("banishing", () => {
     ]);
   });
 
-  it("toggles one row with Cmd or Ctrl and takes a range with Shift, in the order shown", () => {
+  it("toggles one row's checkbox and takes a range with Shift, in the order shown", () => {
     const orderedKeys = ["a", "b", "c", "d", "e"];
-    const click = (key: string, modifiers: { toggle?: boolean; range?: boolean }) => ({
+    const click = (key: string, modifiers: { range?: boolean } = {}) => ({
       key,
       orderedKeys,
-      toggle: modifiers.toggle ?? false,
       range: modifiers.range ?? false,
     });
-    let selection = externalSelectionAfterClick(
-      NO_EXTERNAL_SELECTION,
-      click("b", { toggle: true }),
-    );
+    let selection = externalSelectionAfterClick(NO_EXTERNAL_SELECTION, click("b"));
     expect([...selection.keys]).toEqual(["b"]);
     selection = externalSelectionAfterClick(selection, click("e", { range: true }));
     expect([...selection.keys].toSorted()).toEqual(["b", "c", "d", "e"]);
     // Upwards from the same anchor adds the rows above it.
     selection = externalSelectionAfterClick(selection, click("a", { range: true }));
     expect([...selection.keys].toSorted()).toEqual(["a", "b", "c", "d", "e"]);
-    selection = externalSelectionAfterClick(selection, click("c", { toggle: true }));
+    selection = externalSelectionAfterClick(selection, click("c"));
     expect(selection.keys.has("c")).toBe(false);
     // Shift with nothing to start from selects just that row.
     expect([
       ...externalSelectionAfterClick(NO_EXTERNAL_SELECTION, click("d", { range: true })).keys,
     ]).toEqual(["d"]);
   });
+});
 
-  it("moves keyboard focus to the next row that stays, else the one before", () => {
-    const keys = ["a", "b", "c", "d"];
-    expect(externalFocusAfterBanish(keys, new Set(["b"]), "b")).toBe("c");
-    // A selection leaves together: focus skips past all of it.
-    expect(externalFocusAfterBanish(keys, new Set(["b", "c"]), "b")).toBe("d");
-    expect(externalFocusAfterBanish(keys, new Set(["c", "d"]), "d")).toBe("b");
-    expect(externalFocusAfterBanish(keys, new Set(keys), "a")).toBeNull();
-  });
-
-  it("banishes the whole selection from a selected row, and just the row from any other", () => {
-    const entries = range(0, 4);
-    const selection = {
-      keys: new Set([externalEntryKey(entries[1]!), externalEntryKey(entries[3]!)]),
-      anchor: null,
-    };
-    expect(externalBanishTargets(selection, entries, entries[3]!)).toEqual([
-      entries[1],
-      entries[3],
-    ]);
-    expect(externalBanishTargets(selection, entries, entries[0]!)).toEqual([entries[0]]);
+describe("externalImportWindow", () => {
+  it("takes the sessions since the Previous 30 days group starts, as the groups count them", () => {
+    const groups = externalGroups(NOW);
+    const counts = (byGroup: Record<string, number>) =>
+      groups.map((group) => byGroup[group.id] ?? 0);
+    const view = externalListView({
+      groups,
+      requests: externalListRequests({ groups, listed: new Set(), cursors: {} }),
+      results: [
+        page([], {
+          totalCount: 19,
+          groupCounts: counts({ today: 1, yesterday: 2, week: 3, month: 4, older: 9 }),
+        }),
+      ],
+    });
+    expect(externalImportWindow(groups, view)).toEqual({
+      activeFrom: groups.find((group) => group.id === "month")!.activeFrom,
+      count: 10,
+    });
+    // Nothing to offer until the counts are in.
+    expect(externalImportWindow(groups, null)).toBeNull();
   });
 });
 
