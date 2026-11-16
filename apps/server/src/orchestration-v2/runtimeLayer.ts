@@ -13,6 +13,7 @@ import * as ProviderSessionRuntime from "../persistence/ProviderSessionRuntime.t
 import * as TextGeneration from "../textGeneration/TextGeneration.ts";
 import * as ProviderAuthService from "../provider/ProviderAuthService.ts";
 import * as ProviderInstallationGate from "../provider/ProviderInstallationGate.ts";
+import * as AgentSessionCatalog from "../project/AgentSessionCatalog.ts";
 import * as AgentSessionImporter from "../project/AgentSessionImporter.ts";
 import * as AgentSessionScanner from "../project/AgentSessionScanner.ts";
 import * as ProjectService from "../project/ProjectService.ts";
@@ -260,6 +261,17 @@ const layerAgentSessionImporterProvided = AgentSessionImporter.layer.pipe(
     ),
   ),
 );
+// The session catalog reuses the wizard's scanner and importer, so all three share one scan cache.
+const layerAgentSessionCatalogProvided = AgentSessionCatalog.layer.pipe(
+  Layer.provide(
+    Layer.mergeAll(
+      layerAgentSessionScannerProvided,
+      layerAgentSessionImporterProvided,
+      layerProjectService,
+      ProviderSessionRuntime.layer,
+    ),
+  ),
+);
 
 const layerThreadManagementProvided = ThreadManagementService.layerWithLegacyImporter.pipe(
   Layer.provide(
@@ -411,6 +423,7 @@ export const layerProduction = Layer.mergeAll(
   layerProviderContinuationWorkerProvided,
   layerAgentSessionScannerProvided,
   layerAgentSessionImporterProvided,
+  layerAgentSessionCatalogProvided,
   EffectOutbox.layerPruneWorker.pipe(Layer.provide(EffectOutbox.layer)),
 ).pipe(
   Layer.provide(ResourceCleanupService.layer.pipe(Layer.provide(layerScheduledTaskProvided))),

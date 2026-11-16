@@ -1,5 +1,12 @@
 import * as Schema from "effect/Schema";
-import { IsoDateTime, NonNegativeInt, ProjectId, TrimmedNonEmptyString } from "./baseSchemas.ts";
+import {
+  IsoDateTime,
+  NonNegativeInt,
+  PositiveInt,
+  ProjectId,
+  ThreadId,
+  TrimmedNonEmptyString,
+} from "./baseSchemas.ts";
 import { ProviderInstanceId } from "./providerInstance.ts";
 
 export const AgentSessionSource = Schema.Literals(["claudeAgent", "codex", "pi"]);
@@ -75,13 +82,195 @@ export class AgentSessionImportProjectChangedError extends Schema.TaggedError<Ag
 export const AgentSessionImportResult = Schema.Struct({
   importedCount: NonNegativeInt,
   skippedCount: NonNegativeInt,
+  /** Threads that now hold the imported sessions, including ones imported earlier. */
+  threadIds: Schema.optional(Schema.Array(ThreadId)),
 });
 export type AgentSessionImportResult = typeof AgentSessionImportResult.Type;
+
+/** One native transcript the catalog knows about but no thread holds yet. */
+export const AgentSessionCatalogEntry = Schema.Struct({
+  providerInstanceId: ProviderInstanceId,
+  source: AgentSessionSource,
+  filePath: TrimmedNonEmptyString,
+  title: Schema.NullOr(Schema.String),
+  cwd: Schema.NullOr(Schema.String),
+  /** The folder opening the session uses as its project: the main checkout for a linked worktree. */
+  projectRoot: Schema.String,
+  /** The existing project that folder belongs to; opening the session creates one when null. */
+  projectId: Schema.NullOr(ProjectId),
+  lastActiveAt: IsoDateTime,
+  sizeBytes: NonNegativeInt,
+});
+export type AgentSessionCatalogEntry = typeof AgentSessionCatalogEntry.Type;
+
+export const AgentSessionCatalogCursor = Schema.Struct({
+  lastActiveAt: IsoDateTime,
+  providerInstanceId: ProviderInstanceId,
+  filePath: TrimmedNonEmptyString,
+});
+export type AgentSessionCatalogCursor = typeof AgentSessionCatalogCursor.Type;
+
+/** The most entries one catalog page returns, whatever `limit` asks for. */
+export const AGENT_SESSION_CATALOG_MAX_PAGE_SIZE = 200;
+/** The most spans one catalog read counts sessions in. */
+const AGENT_SESSION_CATALOG_MAX_GROUP_BOUNDS = 32;
+
+export const AgentSessionCatalogInput = Schema.Struct({
+  /** Only entries whose folder belongs to one of these projects. */
+  projectIds: Schema.optional(Schema.Array(ProjectId)),
+  before: Schema.optional(AgentSessionCatalogCursor),
+  /**
+   * Only entries at or newer than this one. A page bounded on both sides keeps its rows when a
+   * session lands inside it, instead of pushing its last row past the next page's start.
+   */
+  through: Schema.optional(AgentSessionCatalogCursor),
+  /** Only entries last active at or after this time. */
+  activeFrom: Schema.optional(IsoDateTime),
+  /** Only entries last active before this time. */
+  activeUntil: Schema.optional(IsoDateTime),
+  /**
+   * Times, newest first, that split the listed sessions into spans: at or after the first, between
+   * each pair, and before the last. The answer counts each span, so collapsed groups can show
+   * their size without listing their rows.
+   */
+  groupBounds: Schema.optional(
+    Schema.Array(IsoDateTime).check(Schema.isMaxLength(AGENT_SESSION_CATALOG_MAX_GROUP_BOUNDS)),
+  ),
+  /** Zero asks only for the counts. */
+  limit: Schema.optional(NonNegativeInt),
+  /** Start indexing new and changed transcripts when the last pass is stale. */
+  refresh: Schema.optional(Schema.Boolean),
+});
+export type AgentSessionCatalogInput = typeof AgentSessionCatalogInput.Type;
+
+/** The ages the External shelf offers to banish everything older than, in months. */
+export const AGENT_SESSION_BANISH_MONTHS = [1, 2, 3, 6, 12] as const;
+
+export const AgentSessionCatalogResult = Schema.Struct({
+  entries: Schema.Array(AgentSessionCatalogEntry),
+  totalCount: NonNegativeInt,
+  indexing: Schema.Boolean,
+  indexedAt: Schema.NullOr(IsoDateTime),
+  /** For each banish preset, how many of the listed sessions were last active before it. */
+  olderThan: Schema.Array(Schema.Struct({ months: PositiveInt, count: NonNegativeInt })),
+  /** How many listed sessions fall in each span `groupBounds` marks out; empty without them. */
+  groupCounts: Schema.Array(NonNegativeInt),
+  /**
+   * Which catalog rows the answer was read from, even while a pass runs; a larger one is newer. It
+   * moves only when the rows change. With the same `listing` too, answers list the same sessions.
+   */
+  revision: NonNegativeInt,
+  /**
+   * A fingerprint of what else decides which sessions are listed: the threads holding sessions,
+   * the providers turned on and the projects. Answers with the same revision and fingerprint list
+   * the same sessions.
+   */
+  listing: Schema.String,
+});
+export type AgentSessionCatalogResult = typeof AgentSessionCatalogResult.Type;
+
+/** One session in the catalog, named by the transcript it lives in. */
+export const AgentSessionRef = Schema.Struct({
+  providerInstanceId: ProviderInstanceId,
+  filePath: TrimmedNonEmptyString,
+});
+export type AgentSessionRef = typeof AgentSessionRef.Type;
+
+/**
+ * Takes sessions off the External shelf into the archive: chosen ones, or every listed session last
+ * active more than `months` ago. A banished session comes back by itself once it sees new activity.
+ */
+export const AgentSessionBanishInput = Schema.Union([
+  Schema.Struct({ kind: Schema.Literal("sessions"), sessions: Schema.Array(AgentSessionRef) }),
+  Schema.Struct({
+    kind: Schema.Literal("olderThan"),
+    months: PositiveInt,
+    projectIds: Schema.optional(Schema.Array(ProjectId)),
+  }),
+]);
+export type AgentSessionBanishInput = typeof AgentSessionBanishInput.Type;
+
+export const AgentSessionBanishResult = Schema.Struct({
+  /** Restoring this batch undoes the banish in one step. */
+  batchId: TrimmedNonEmptyString,
+  count: NonNegativeInt,
+});
+export type AgentSessionBanishResult = typeof AgentSessionBanishResult.Type;
+
+export const AgentSessionRestoreInput = Schema.Union([
+  Schema.Struct({ kind: Schema.Literal("batch"), batchId: TrimmedNonEmptyString }),
+  Schema.Struct({ kind: Schema.Literal("sessions"), sessions: Schema.Array(AgentSessionRef) }),
+]);
+export type AgentSessionRestoreInput = typeof AgentSessionRestoreInput.Type;
+
+export const AgentSessionRestoreResult = Schema.Struct({ count: NonNegativeInt });
+export type AgentSessionRestoreResult = typeof AgentSessionRestoreResult.Type;
+
+export const AgentSessionBanishedInput = Schema.Struct({
+  projectIds: Schema.optional(Schema.Array(ProjectId)),
+  before: Schema.optional(AgentSessionCatalogCursor),
+  limit: Schema.optional(PositiveInt),
+});
+export type AgentSessionBanishedInput = typeof AgentSessionBanishedInput.Type;
+
+export const AgentSessionBanishedEntry = Schema.Struct({
+  ...AgentSessionCatalogEntry.fields,
+  banishedAt: IsoDateTime,
+});
+export type AgentSessionBanishedEntry = typeof AgentSessionBanishedEntry.Type;
+
+/** Banished sessions still on disk, newest activity first. */
+export const AgentSessionBanishedResult = Schema.Struct({
+  entries: Schema.Array(AgentSessionBanishedEntry),
+  totalCount: NonNegativeInt,
+});
+export type AgentSessionBanishedResult = typeof AgentSessionBanishedResult.Type;
+
+export const AgentSessionHydrateInput = Schema.Struct({
+  providerInstanceId: ProviderInstanceId,
+  filePath: TrimmedNonEmptyString,
+});
+export type AgentSessionHydrateInput = typeof AgentSessionHydrateInput.Type;
+
+export const AgentSessionHydrateResult = Schema.Struct({
+  threadId: ThreadId,
+  projectId: ProjectId,
+});
+export type AgentSessionHydrateResult = typeof AgentSessionHydrateResult.Type;
+
+export class AgentSessionHydrateError extends Schema.TaggedError<AgentSessionHydrateError>()(
+  "AgentSessionHydrateError",
+  {
+    reason: Schema.Literals([
+      "disabled",
+      "not-found",
+      "provider-disabled",
+      "no-project",
+      "not-importable",
+    ]),
+    filePath: Schema.String,
+  },
+) {
+  override get message(): string {
+    switch (this.reason) {
+      case "disabled":
+        return "External sessions are turned off in Labs settings.";
+      case "not-found":
+        return "That session's transcript is no longer on disk.";
+      case "provider-disabled":
+        return "Turn the provider that ran this session back on to open it.";
+      case "no-project":
+        return "That session's folder is missing or cannot be opened as a project.";
+      case "not-importable":
+        return "That session has no conversation T3 Code can open.";
+    }
+  }
+}
 
 export class AgentSessionScanError extends Schema.TaggedError<AgentSessionScanError>()(
   "AgentSessionScanError",
   {
-    operation: Schema.Literals(["read-settings", "read-projects"]),
+    operation: Schema.Literals(["read-settings", "read-projects", "read-catalog"]),
     cause: Schema.Defect(),
   },
 ) {

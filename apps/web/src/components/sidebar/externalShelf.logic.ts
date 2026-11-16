@@ -1,0 +1,660 @@
+import {
+  AGENT_SESSION_BANISH_MONTHS,
+  AGENT_SESSION_CATALOG_MAX_PAGE_SIZE,
+  ProjectId,
+  type AgentSessionCatalogCursor,
+  type AgentSessionCatalogEntry,
+  type AgentSessionCatalogInput,
+  type AgentSessionCatalogResult,
+  type AgentSessionSource,
+  type EnvironmentId,
+} from "@t3tools/contracts";
+import * as Cause from "effect/Cause";
+import { AsyncResult } from "effect/reactivity";
+
+/** Rows a group lists when first opened, and how many each "Show more" adds. */
+export const EXTERNAL_FIRST_PAGE_SIZE = 10;
+export const EXTERNAL_PAGE_SIZE = 25;
+/** The server's page cap; a bounded page that reaches it may have lost rows past its end. */
+export const EXTERNAL_BOUNDED_PAGE_LIMIT = AGENT_SESSION_CATALOG_MAX_PAGE_SIZE;
+
+/**
+ * Which projects the shelf asks the server for. A sidebar scoped to projects shows only their
+ * sessions, so a scope with no project on this server shows no shelf at all (null).
+ */
+export function externalProjectIds(
+  environmentId: EnvironmentId,
+  scopedProjectKeys: ReadonlySet<string> | null,
+): ReadonlyArray<ProjectId> | undefined | null {
+  if (scopedProjectKeys === null) return undefined;
+  const prefix = `${environmentId}:`;
+  const projectIds = [...scopedProjectKeys].flatMap((key) =>
+    key.startsWith(prefix) ? [ProjectId.make(key.slice(prefix.length))] : [],
+  );
+  return projectIds.length === 0 ? null : projectIds.toSorted();
+}
+
+/** A span of last activity the shelf groups sessions by, newest first. */
+export interface ExternalGroup {
+  readonly id: string;
+  readonly label: string;
+  /** At or after; the oldest group has none. */
+  readonly activeFrom?: string;
+  /** Before; the newest group has none. */
+  readonly activeUntil?: string;
+}
+
+/** How many calendar months before the last 30 days get a group of their own. */
+const MONTH_GROUPS = 12;
+
+/**
+ * The groups for `nowMinute` (UTC, to the minute) in this device's time zone: today, yesterday,
+ * the 7 and 30 days before, each month before that for a year, then everything older. Each group
+ * ends where the next one starts, so every session falls in exactly one.
+ */
+export function externalGroups(nowMinute: string): ReadonlyArray<ExternalGroup> {
+  const now = new Date(`${nowMinute}:00.000Z`);
+  const [year, month, date] = [now.getFullYear(), now.getMonth(), now.getDate()];
+  const midnight = (daysBack: number) => new Date(year, month, date - daysBack).toISOString();
+  const groups: Array<ExternalGroup> = [
+    { id: "today", label: "Today", activeFrom: midnight(0) },
+    { id: "yesterday", label: "Yesterday", activeFrom: midnight(1), activeUntil: midnight(0) },
+    { id: "week", label: "Previous 7 days", activeFrom: midnight(7), activeUntil: midnight(1) },
+    { id: "month", label: "Previous 30 days", activeFrom: midnight(30), activeUntil: midnight(7) },
+  ];
+  const monthName = new Intl.DateTimeFormat(undefined, { month: "long" });
+  const monthAndYear = new Intl.DateTimeFormat(undefined, { month: "long", year: "numeric" });
+  let until = new Date(year, month, date - 30);
+  for (let back = 0; back < MONTH_GROUPS; back++) {
+    const start = new Date(year, month - back, 1);
+    // A month inside the last 30 days is already covered by the groups above.
+    if (start >= until) continue;
+    groups.push({
+      id: `month:${start.getFullYear()}-${String(start.getMonth() + 1).padStart(2, "0")}`,
+      label: (start.getFullYear() === year ? monthName : monthAndYear).format(start),
+      activeFrom: start.toISOString(),
+      activeUntil: until.toISOString(),
+    });
+    until = start;
+  }
+  groups.push({ id: "older", label: "Older", activeUntil: until.toISOString() });
+  return groups;
+}
+
+/** Groups open until the person chooses otherwise, so a new session today never shuts them. */
+const RECENT_GROUPS: ReadonlySet<string> = new Set(["today", "yesterday", "week"]);
+
+/**
+ * Which groups with sessions in them are open: what the person chose for each, else the recent
+ * groups, else (when nothing is recent) the newest group.
+ */
+export function externalOpenGroups(
+  groups: ReadonlyArray<ExternalGroup>,
+  counts: ReadonlyArray<number>,
+  chosen: Readonly<Record<string, boolean>>,
+): ReadonlySet<string> {
+  const filled = groups.filter((_, index) => (counts[index] ?? 0) > 0);
+  const recent = filled.some((group) => RECENT_GROUPS.has(group.id));
+  const newest = filled[0]?.id;
+  return new Set(
+    filled.flatMap((group) =>
+      (chosen[group.id] ?? (RECENT_GROUPS.has(group.id) || (!recent && group.id === newest)))
+        ? [group.id]
+        : [],
+    ),
+  );
+}
+
+/**
+ * The group open only because nothing recent has sessions, while the person has not chosen for
+ * it. The shelf remembers it as opened, so a new session today does not shut the group being read.
+ */
+export function externalFallbackGroup(
+  groups: ReadonlyArray<ExternalGroup>,
+  counts: ReadonlyArray<number>,
+  chosen: Readonly<Record<string, boolean>>,
+): string | null {
+  const filled = groups.filter((_, index) => (counts[index] ?? 0) > 0);
+  if (filled.some((group) => RECENT_GROUPS.has(group.id))) return null;
+  const newest = filled[0];
+  return newest !== undefined && chosen[newest.id] === undefined ? newest.id : null;
+}
+
+/**
+ * The groups drawn open: worked out from the groups in the view on screen, with their counts, so
+ * rows stay until the answers agree again, even when a new day or month has changed the groups the
+ * requests use.
+ */
+export function externalShownOpenGroups(
+  view: ExternalShelfView | null,
+  chosen: Readonly<Record<string, boolean>>,
+): ReadonlySet<string> {
+  if (view === null) return new Set();
+  return externalOpenGroups(
+    view.groups.map(({ group }) => group),
+    view.groups.map(({ count }) => count),
+    chosen,
+  );
+}
+
+/**
+ * The fallback group to remember as opened, once the person has seen it open: the shelf is
+ * expanded and the first pass has finished, so a collapsed shelf, another scope or a half-read
+ * first pass never opens groups for good.
+ */
+export function externalFallbackToRemember(
+  view: ExternalShelfView | null,
+  expanded: boolean,
+  chosen: Readonly<Record<string, boolean>>,
+): string | null {
+  if (!expanded || view === null || view.firstIndex) return null;
+  return externalFallbackGroup(
+    view.groups.map(({ group }) => group),
+    view.groups.map(({ count }) => count),
+    chosen,
+  );
+}
+
+/** Each group's count in the view on screen, in group order; zero for a group it does not show. */
+export function externalViewCounts(
+  groups: ReadonlyArray<ExternalGroup>,
+  view: ExternalShelfView | null,
+): ReadonlyArray<number> {
+  return groups.map(
+    (group) => view?.groups.find((shown) => shown.group.id === group.id)?.count ?? 0,
+  );
+}
+
+type PageScope = Pick<AgentSessionCatalogInput, "projectIds" | "activeFrom" | "activeUntil">;
+
+/** The request that counts every group and the banish presets; it alone starts index passes. */
+export function externalSummaryInput(
+  projectIds: ReadonlyArray<ProjectId> | undefined,
+  groups: ReadonlyArray<ExternalGroup>,
+): AgentSessionCatalogInput {
+  return {
+    ...(projectIds === undefined ? {} : { projectIds }),
+    limit: 0,
+    refresh: true,
+    groupBounds: groups.flatMap((group, index) =>
+      index < groups.length - 1 && group.activeFrom !== undefined ? [group.activeFrom] : [],
+    ),
+  };
+}
+
+/**
+ * The request for each page an open group shows. Every page but the last ends at the row "Show
+ * more" was pressed after, so a session that lands inside a page stays in it instead of pushing a
+ * row out of view.
+ */
+export function externalGroupPageInputs(input: {
+  readonly projectIds: ReadonlyArray<ProjectId> | undefined;
+  readonly group: ExternalGroup;
+  readonly cursors: ReadonlyArray<AgentSessionCatalogCursor>;
+}): ReadonlyArray<AgentSessionCatalogInput> {
+  const { group, cursors } = input;
+  const scope: PageScope = {
+    ...(input.projectIds === undefined ? {} : { projectIds: input.projectIds }),
+    ...(group.activeFrom === undefined ? {} : { activeFrom: group.activeFrom }),
+    ...(group.activeUntil === undefined ? {} : { activeUntil: group.activeUntil }),
+  };
+  const last = cursors.at(-1);
+  if (last === undefined) return [{ ...scope, limit: EXTERNAL_FIRST_PAGE_SIZE }];
+  return [
+    ...cursors.map((through, index) => {
+      const before = cursors[index - 1];
+      return {
+        ...scope,
+        ...(before === undefined ? {} : { before }),
+        through,
+        limit: EXTERNAL_BOUNDED_PAGE_LIMIT,
+      };
+    }),
+    { ...scope, before: last, limit: EXTERNAL_PAGE_SIZE },
+  ];
+}
+
+/** Every request the shelf makes, the summary first, and which of them belong to each group. */
+export interface ExternalShelfRequests {
+  readonly inputs: ReadonlyArray<AgentSessionCatalogInput>;
+  readonly groupPages: ReadonlyArray<{
+    readonly groupId: string;
+    readonly start: number;
+    readonly end: number;
+  }>;
+}
+
+export function externalShelfRequests(input: {
+  readonly projectIds: ReadonlyArray<ProjectId> | undefined;
+  readonly groups: ReadonlyArray<ExternalGroup>;
+  /** Groups whose rows are read: open groups of an expanded shelf. */
+  readonly listed: ReadonlySet<string>;
+  readonly cursors: Readonly<Record<string, ReadonlyArray<AgentSessionCatalogCursor>>>;
+}): ExternalShelfRequests {
+  const inputs: Array<AgentSessionCatalogInput> = [
+    externalSummaryInput(input.projectIds, input.groups),
+  ];
+  const groupPages: Array<{ groupId: string; start: number; end: number }> = [];
+  for (const group of input.groups) {
+    if (!input.listed.has(group.id)) continue;
+    const start = inputs.length;
+    inputs.push(
+      ...externalGroupPageInputs({
+        projectIds: input.projectIds,
+        group,
+        cursors: input.cursors[group.id] ?? [],
+      }),
+    );
+    groupPages.push({ groupId: group.id, start, end: inputs.length });
+  }
+  return { inputs, groupPages };
+}
+
+/** Where the next page starts: just after the last row shown. */
+export function externalCursorAfter(entry: AgentSessionCatalogEntry): AgentSessionCatalogCursor {
+  return {
+    lastActiveAt: entry.lastActiveAt,
+    providerInstanceId: entry.providerInstanceId,
+    filePath: entry.filePath,
+  };
+}
+
+export interface ExternalGroupView {
+  readonly group: ExternalGroup;
+  readonly count: number;
+  /** The group's rows, or null when its pages were not part of this answer. */
+  readonly entries: ReadonlyArray<AgentSessionCatalogEntry> | null;
+  /** How many the group's "Show more" adds; zero hides it. */
+  readonly showMoreCount: number;
+  /** A bounded page came back at the cap and may hide rows: start the group again. */
+  readonly overflowed: boolean;
+}
+
+export interface ExternalShelfView {
+  /** Sessions the shelf could list in all, shown or not. */
+  readonly totalCount: number;
+  readonly indexing: boolean;
+  /** No index pass has finished yet, so rows still arrive in no particular order. */
+  readonly firstIndex: boolean;
+  /** For each banish preset, how many listed sessions it would take. */
+  readonly olderThan: AgentSessionCatalogResult["olderThan"];
+  /** Groups with sessions in them, newest first. */
+  readonly groups: ReadonlyArray<ExternalGroupView>;
+  /** Every row shown, in order, across the open groups. */
+  readonly entries: ReadonlyArray<AgentSessionCatalogEntry>;
+}
+
+/**
+ * Answers join only when read from the same revision and listing, so no session shows twice or not
+ * at all; a running pass does not matter. Until the first pass ends each answer stands alone.
+ */
+function externalAnswersAgree(results: ReadonlyArray<AgentSessionCatalogResult>): boolean {
+  const summary = results[0];
+  if (summary === undefined) return false;
+  if (summary.indexedAt === null) return true;
+  return results.every(
+    (result) => result.revision === summary.revision && result.listing === summary.listing,
+  );
+}
+
+/**
+ * Answers to read again, by position, once all have answered: those on an older revision, else
+ * every one when they share a revision but list different things. None before the first pass ends.
+ */
+export function externalLaggingPages(
+  results: ReadonlyArray<AgentSessionCatalogResult | null>,
+): ReadonlyArray<number> {
+  const answered = results.filter((result) => result !== null);
+  if (results.length < 2 || answered.length < results.length) return [];
+  if (answered[0]!.indexedAt === null) return [];
+  const newest = Math.max(...answered.map((result) => result.revision));
+  const older = answered.flatMap((result, index) => (result.revision === newest ? [] : [index]));
+  if (older.length > 0) return older;
+  const listing = answered[0]!.listing;
+  return answered.every((result) => result.listing === listing)
+    ? []
+    : answered.map((_, index) => index);
+}
+
+/** The shelf once every request has a current answer and they agree. */
+export function externalShelfView(input: {
+  readonly groups: ReadonlyArray<ExternalGroup>;
+  readonly requests: ExternalShelfRequests;
+  readonly results: ReadonlyArray<AgentSessionCatalogResult | null>;
+}): ExternalShelfView | null {
+  const { groups, requests } = input;
+  const results = input.results.flatMap((result) => (result === null ? [] : [result]));
+  const summary = results[0];
+  if (summary === undefined || results.length < requests.inputs.length) return null;
+  if (!externalAnswersAgree(results)) return null;
+  const firstIndex = summary.indexedAt === null;
+  // Bounded pages and spans do not overlap; a repeat could only come from a race, and one row per
+  // key keeps the list a valid React list either way.
+  const seen = new Set<string>();
+  const unseen = (entry: AgentSessionCatalogEntry) => {
+    const key = externalEntryKey(entry);
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  };
+  const groupViews = groups.flatMap((group, index): Array<ExternalGroupView> => {
+    const count = summary.groupCounts[index] ?? 0;
+    if (count === 0) return [];
+    const span = requests.groupPages.find((pages) => pages.groupId === group.id);
+    if (span === undefined) {
+      return [{ group, count, entries: null, showMoreCount: 0, overflowed: false }];
+    }
+    const pages = requests.inputs.slice(span.start, span.end).map((pageInput, offset) => ({
+      input: pageInput,
+      result: results[span.start + offset]!,
+    }));
+    const entries = pages.flatMap((page) => page.result.entries).filter(unseen);
+    const last = pages.at(-1)!;
+    const lastFull = last.result.entries.length >= (last.input.limit ?? EXTERNAL_PAGE_SIZE);
+    const total = pages[0]!.result.totalCount;
+    return [
+      {
+        group,
+        count,
+        entries,
+        showMoreCount:
+          !firstIndex && lastFull
+            ? Math.min(Math.max(0, total - entries.length), EXTERNAL_PAGE_SIZE)
+            : 0,
+        overflowed: pages.some(
+          (page) =>
+            page.input.through !== undefined &&
+            page.result.entries.length >= (page.input.limit ?? EXTERNAL_BOUNDED_PAGE_LIMIT),
+        ),
+      },
+    ];
+  });
+  return {
+    totalCount: summary.totalCount,
+    indexing: summary.indexing,
+    firstIndex,
+    olderThan: summary.olderThan,
+    groups: groupViews,
+    entries: groupViews.flatMap((group) => group.entries ?? []),
+  };
+}
+
+export function externalEntryKey(entry: AgentSessionCatalogEntry): string {
+  return `external:${entry.providerInstanceId}:${entry.filePath}`;
+}
+
+/**
+ * An answer once it is current. A request being re-read still carries its previous answer, which
+ * can hold a session opened since; it does not count until the new answer lands.
+ */
+export function externalSettledAnswer<A>(result: AsyncResult.AsyncResult<A, unknown>): A | null {
+  return result.waiting ? null : AsyncResult.getOrElse(result, () => null);
+}
+
+/**
+ * A request's answer only when its last read succeeded and is not being redone. A failed read can
+ * still carry an older answer; re-reading it for being old would fail again and again.
+ */
+export function externalSucceededAnswer<A>(result: AsyncResult.AsyncResult<A, unknown>): A | null {
+  return result._tag === "Success" && !result.waiting ? result.value : null;
+}
+
+/** What the shelf lists: the fresh view, else the last one of this scope while answers load. */
+export function externalShownView(
+  kept: { readonly scopeKey: string; readonly view: ExternalShelfView } | null,
+  scopeKey: string,
+  fresh: ExternalShelfView | null,
+): ExternalShelfView | null {
+  return fresh ?? (kept?.scopeKey === scopeKey ? kept.view : null);
+}
+
+/** The shelf's own last row: why it shows nothing, or that it is still reading. */
+export type ExternalShelfStatus = "retry" | "loading" | "reading" | "empty" | null;
+
+/**
+ * Whether the rows on screen are about to change: a request has no answer yet, the answers have
+ * all arrived but from different passes (the lagging ones re-read), or the rows were built for
+ * other requests (a group just opened or paged). A re-read of the same requests is not: paging
+ * from the rows shown is right whichever pass they came from.
+ */
+export function externalShelfMoving(input: {
+  readonly fresh: ExternalShelfView | null;
+  readonly settled: ReadonlyArray<AgentSessionCatalogResult | null>;
+  readonly loading: boolean;
+  /** The rows on screen were built from the requests made now. */
+  readonly shownCurrent: boolean;
+  /** A read failed: the shelf offers a retry, and nothing is on its way. */
+  readonly failed: boolean;
+}): boolean {
+  if (input.fresh !== null || input.failed) return false;
+  return input.loading || !input.shownCurrent || input.settled.every((answer) => answer !== null);
+}
+
+export function externalShelfStatus(input: {
+  readonly shown: ExternalShelfView | null;
+  readonly failed: boolean;
+}): ExternalShelfStatus {
+  const { shown } = input;
+  if (input.failed) return "retry";
+  // Nothing on screen and nothing failed: something is still on its way.
+  if (shown === null) return "loading";
+  if (shown.firstIndex && shown.indexing) return "reading";
+  return shown.totalCount === 0 && !shown.indexing ? "empty" : null;
+}
+
+/** An open group's last row: loading its rows, or "Show more" (held while anything moves). */
+export type ExternalGroupFooter =
+  | { readonly kind: "loading" }
+  | { readonly kind: "more"; readonly count: number; readonly busy: boolean }
+  | null;
+
+export function externalGroupFooter(input: {
+  readonly group: ExternalGroupView;
+  readonly moving: boolean;
+  readonly opening: boolean;
+  /** The shelf offers a retry below; a group waiting on the failed read shows nothing more. */
+  readonly failed: boolean;
+}): ExternalGroupFooter {
+  const { group } = input;
+  if (group.entries === null) return input.failed ? null : { kind: "loading" };
+  if (group.showMoreCount === 0) return null;
+  return { kind: "more", count: group.showMoreCount, busy: input.moving || input.opening };
+}
+
+/** What the shelf last saw of the things that change what it lists from outside it. */
+export interface ExternalObserved {
+  readonly nowMinute: string;
+  readonly heldThreadCount: number;
+  readonly banishVersion: number;
+}
+
+/**
+ * Whether a change since the last look calls for a re-read. A change to the threads held or to
+ * what is banished always does; a new minute only while the shelf is open and in view, so a
+ * window left in the background does not walk every home once a minute.
+ */
+export function externalRefreshDue(
+  observed: ExternalObserved,
+  current: ExternalObserved,
+  shelf: { readonly expanded: boolean; readonly visible: boolean },
+): boolean {
+  if (
+    observed.heldThreadCount !== current.heldThreadCount ||
+    observed.banishVersion !== current.banishVersion
+  ) {
+    return true;
+  }
+  return observed.nowMinute !== current.nowMinute && shelf.expanded && shelf.visible;
+}
+
+/**
+ * "Show more" adds a page to the group that starts after its last row shown. Pressed again before
+ * that page shows, it adds nothing: the page after the same row is already asked for.
+ */
+export function externalCursorsAfterShowMore(
+  group: ExternalGroupView,
+  cursors: ReadonlyArray<AgentSessionCatalogCursor>,
+): ReadonlyArray<AgentSessionCatalogCursor> {
+  const last = group.entries?.at(-1);
+  if (last === undefined || group.showMoreCount === 0) return cursors;
+  const next = externalCursorAfter(last);
+  const previous = cursors.at(-1);
+  return previous !== undefined &&
+    previous.lastActiveAt === next.lastActiveAt &&
+    previous.providerInstanceId === next.providerInstanceId &&
+    previous.filePath === next.filePath
+    ? cursors
+    : [...cursors, next];
+}
+
+/** A group whose bounded page reached the cap may hide rows, so it pages again from its top. */
+export function externalCursorsAfterAnswer(
+  view: ExternalShelfView | null,
+  cursors: Readonly<Record<string, ReadonlyArray<AgentSessionCatalogCursor>>>,
+): Readonly<Record<string, ReadonlyArray<AgentSessionCatalogCursor>>> {
+  const reset = (view?.groups ?? []).filter(
+    (group) => group.overflowed && (cursors[group.group.id]?.length ?? 0) > 0,
+  );
+  if (reset.length === 0) return cursors;
+  const next = { ...cursors };
+  for (const group of reset) delete next[group.group.id];
+  return next;
+}
+
+/**
+ * One open at a time: a second click, on any row, while an import runs would start a second import
+ * and race the first for where the window lands.
+ */
+export function createExternalOpenGate() {
+  let opening: string | null = null;
+  return {
+    tryEnter: (key: string): boolean => {
+      if (opening !== null) return false;
+      opening = key;
+      return true;
+    },
+    leave: (): void => {
+      opening = null;
+    },
+  };
+}
+
+function folderName(path: string): string {
+  const parts = path.split(/[\\/]/).filter((part) => part.length > 0);
+  return parts.at(-1) ?? path;
+}
+
+/** A session with no first request is named after the folder it ran in. */
+export function externalEntryTitle(entry: AgentSessionCatalogEntry): string {
+  const title = entry.title?.trim();
+  return title !== undefined && title.length > 0
+    ? title
+    : folderName(entry.cwd ?? entry.projectRoot);
+}
+
+const SOURCE_NAMES: Record<AgentSessionSource, string> = {
+  claudeAgent: "Claude Code",
+  codex: "Codex",
+  pi: "Pi",
+};
+
+/** Which tool ran the session and where, for the row's tooltip. */
+export function externalEntryOrigin(entry: AgentSessionCatalogEntry): string {
+  return `${SOURCE_NAMES[entry.source]} in ${entry.cwd ?? entry.projectRoot}`;
+}
+
+/** Which tool ran the session and in which folder, short enough for one line. */
+export function externalEntryPlace(entry: AgentSessionCatalogEntry): string {
+  return `${SOURCE_NAMES[entry.source]} in ${folderName(entry.cwd ?? entry.projectRoot)}`;
+}
+
+/**
+ * Where keyboard focus goes when rows are banished from the keyboard: the next row that stays,
+ * else the one before it, so a second Delete carries on down the list.
+ */
+export function externalFocusAfterBanish(
+  orderedKeys: ReadonlyArray<string>,
+  leaving: ReadonlySet<string>,
+  fromKey: string,
+): string | null {
+  const index = orderedKeys.indexOf(fromKey);
+  const after = orderedKeys.slice(index + 1).find((key) => !leaving.has(key));
+  if (after !== undefined) return after;
+  return (
+    orderedKeys
+      .slice(0, Math.max(index, 0))
+      .toReversed()
+      .find((key) => !leaving.has(key)) ?? null
+  );
+}
+
+/** The banish menu: each age preset with how many listed sessions it would take. */
+export function externalBanishPresets(
+  view: ExternalShelfView | null,
+): ReadonlyArray<{ readonly months: number; readonly label: string; readonly count: number }> {
+  return AGENT_SESSION_BANISH_MONTHS.map((months) => ({
+    months,
+    label: months === 1 ? "Older than 1 month" : `Older than ${months} months`,
+    count: view?.olderThan.find((preset) => preset.months === months)?.count ?? 0,
+  }));
+}
+
+export interface ExternalSelection {
+  readonly keys: ReadonlySet<string>;
+  /** Where a shift-click range starts: the last row clicked with a modifier. */
+  readonly anchor: string | null;
+}
+
+export const NO_EXTERNAL_SELECTION: ExternalSelection = { keys: new Set(), anchor: null };
+
+/**
+ * Cmd or Ctrl toggles one row; Shift selects every row between the anchor and this one, in the
+ * order shown. A plain click is an open, not a selection.
+ */
+export function externalSelectionAfterClick(
+  selection: ExternalSelection,
+  click: {
+    readonly key: string;
+    readonly orderedKeys: ReadonlyArray<string>;
+    readonly toggle: boolean;
+    readonly range: boolean;
+  },
+): ExternalSelection {
+  if (click.range && selection.anchor !== null) {
+    const from = click.orderedKeys.indexOf(selection.anchor);
+    const to = click.orderedKeys.indexOf(click.key);
+    if (from >= 0 && to >= 0) {
+      const [start, end] = from <= to ? [from, to] : [to, from];
+      return {
+        keys: new Set([...selection.keys, ...click.orderedKeys.slice(start, end + 1)]),
+        anchor: selection.anchor,
+      };
+    }
+  }
+  const keys = new Set(selection.keys);
+  if (keys.has(click.key)) keys.delete(click.key);
+  else keys.add(click.key);
+  return { keys, anchor: click.key };
+}
+
+/** A banish from a selected row takes the whole selection; from any other row, just that row. */
+export function externalBanishTargets(
+  selection: ExternalSelection,
+  entries: ReadonlyArray<AgentSessionCatalogEntry>,
+  from: AgentSessionCatalogEntry,
+): ReadonlyArray<AgentSessionCatalogEntry> {
+  const fromKey = externalEntryKey(from);
+  if (!selection.keys.has(fromKey)) return [from];
+  return entries.filter((entry) => selection.keys.has(externalEntryKey(entry)));
+}
+
+/** The server's own reason when it refused the open, else a plain failure. */
+export function externalOpenFailureMessage(cause: Cause.Cause<unknown>): string {
+  const error = Cause.squash(cause);
+  return error instanceof Error &&
+    "_tag" in error &&
+    error._tag === "AgentSessionHydrateError" &&
+    error.message.length > 0
+    ? error.message
+    : "The session could not be opened. Try again.";
+}

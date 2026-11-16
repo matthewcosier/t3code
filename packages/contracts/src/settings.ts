@@ -1370,6 +1370,8 @@ export const ServerSettings = Schema.Struct({
   worktreesDirectory: TrimmedString.pipe(Schema.withDecodingDefault(Effect.succeed(""))),
   /** macOS only, Labs beta: clone new worktrees from a cached checkout instead of writing every file. */
   fastWorktreeCheckout: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(false))),
+  /** Labs beta: index native agent transcripts and list the ones no thread holds yet. */
+  externalSessions: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(false))),
   /** Server-maintained history keeps old worktrees eligible for cleanup and review diffs. */
   previousWorktreesDirectories: Schema.Array(TrimmedString).pipe(
     Schema.withDecodingDefault(Effect.succeed([])),
@@ -1841,6 +1843,7 @@ export const ServerSettingsPatch = Schema.Struct({
   ),
   worktreesDirectory: Schema.optionalKey(TrimmedString),
   fastWorktreeCheckout: Schema.optionalKey(Schema.Boolean),
+  externalSessions: Schema.optionalKey(Schema.Boolean),
   responseStreamingMode: Schema.optionalKey(ResponseStreamingMode),
   enableProviderUpdateChecks: Schema.optionalKey(Schema.Boolean),
   continueThreadsAfterServerUpdate: Schema.optionalKey(Schema.Boolean),

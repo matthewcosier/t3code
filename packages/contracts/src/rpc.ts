@@ -93,6 +93,15 @@ import {
   FilesystemBrowseError,
 } from "./filesystem.ts";
 import {
+  AgentSessionCatalogInput,
+  AgentSessionCatalogResult,
+  AgentSessionHydrateError,
+  AgentSessionHydrateInput,
+  AgentSessionBanishedInput,
+  AgentSessionBanishedResult,
+  AgentSessionBanishInput,
+  AgentSessionBanishResult,
+  AgentSessionHydrateResult,
   AgentSessionImportInput,
   AgentSessionImportProjectChangedError,
   AgentSessionImportProjectNotFoundError,
@@ -100,6 +109,8 @@ import {
   AgentSessionScanInput,
   AgentSessionScanResult,
   AgentSessionScanError,
+  AgentSessionRestoreInput,
+  AgentSessionRestoreResult,
 } from "./agentSessions.ts";
 import {
   AssetAccessError,
@@ -432,6 +443,11 @@ export const WS_METHODS = {
   filesystemGetMetadata: "filesystem.getMetadata",
   agentSessionsScan: "agentSessions.scan",
   agentSessionsImport: "agentSessions.import",
+  agentSessionsCatalog: "agentSessions.catalog",
+  agentSessionsHydrate: "agentSessions.hydrate",
+  agentSessionsBanish: "agentSessions.banish",
+  agentSessionsRestore: "agentSessions.restore",
+  agentSessionsBanished: "agentSessions.banished",
   assetsCreateUrl: "assets.createUrl",
   assetsPersistChatAttachments: "assets.persistChatAttachments",
   attachmentsCreateUploadUrl: "attachments.createUploadUrl",
@@ -1466,6 +1482,42 @@ const WsAgentSessionsImportRpc = Rpc.make(WS_METHODS.agentSessionsImport, {
   ]),
 });
 
+const WsAgentSessionsCatalogRpc = Rpc.make(WS_METHODS.agentSessionsCatalog, {
+  payload: AgentSessionCatalogInput,
+  success: AgentSessionCatalogResult,
+  error: Schema.Union([AgentSessionScanError, EnvironmentAuthorizationError]),
+});
+
+const WsAgentSessionsHydrateRpc = Rpc.make(WS_METHODS.agentSessionsHydrate, {
+  payload: AgentSessionHydrateInput,
+  success: AgentSessionHydrateResult,
+  error: Schema.Union([
+    AgentSessionHydrateError,
+    AgentSessionImportProjectChangedError,
+    AgentSessionImportProjectNotFoundError,
+    AgentSessionScanError,
+    EnvironmentAuthorizationError,
+  ]),
+});
+
+const WsAgentSessionsBanishRpc = Rpc.make(WS_METHODS.agentSessionsBanish, {
+  payload: AgentSessionBanishInput,
+  success: AgentSessionBanishResult,
+  error: Schema.Union([AgentSessionScanError, EnvironmentAuthorizationError]),
+});
+
+const WsAgentSessionsRestoreRpc = Rpc.make(WS_METHODS.agentSessionsRestore, {
+  payload: AgentSessionRestoreInput,
+  success: AgentSessionRestoreResult,
+  error: Schema.Union([AgentSessionScanError, EnvironmentAuthorizationError]),
+});
+
+const WsAgentSessionsBanishedRpc = Rpc.make(WS_METHODS.agentSessionsBanished, {
+  payload: AgentSessionBanishedInput,
+  success: AgentSessionBanishedResult,
+  error: Schema.Union([AgentSessionScanError, EnvironmentAuthorizationError]),
+});
+
 const WsAssetsCreateUrlRpc = Rpc.make(WS_METHODS.assetsCreateUrl, {
   payload: AssetCreateUrlInput,
   success: AssetCreateUrlResult,
@@ -2247,6 +2299,11 @@ export const WsRpcGroup = RpcGroup.make(
   WsFilesystemGetMetadataRpc,
   WsAgentSessionsScanRpc,
   WsAgentSessionsImportRpc,
+  WsAgentSessionsCatalogRpc,
+  WsAgentSessionsHydrateRpc,
+  WsAgentSessionsBanishRpc,
+  WsAgentSessionsRestoreRpc,
+  WsAgentSessionsBanishedRpc,
   WsAssetsCreateUrlRpc,
   WsAssetsPersistChatAttachmentsRpc,
   WsAttachmentsCreateUploadUrlRpc,

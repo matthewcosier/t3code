@@ -279,6 +279,8 @@ const makeImporter = Effect.fn(function* (
   const importer = Context.get(context, AgentSessionImporter.AgentSessionImporter);
   return {
     run: importer.importRecentAgentThreads({ projectId }),
+    importChosen: (chosen: ReadonlyArray<AgentSessionScanner.AgentSessionTranscriptFile>) =>
+      importer.importRecentAgentThreads({ projectId }, { chosen, active: true }),
     importNativeHistory: importer.importNativeHistory,
     published,
   };
@@ -1049,5 +1051,104 @@ it.effect("repeated imports reach linked-worktree sessions behind the scan budge
       ),
     );
     expect(oldest.worktreePath).toBe(worktree);
+  }).pipe(Effect.scoped, Effect.provide(Layer.merge(persistence, NodeServices.layer))),
+);
+
+it.effect("imports a chosen session of any age as an active thread, once", () =>
+  Effect.gen(function* () {
+    const fs = yield* FileSystem.FileSystem;
+    const path = yield* Path.Path;
+    const root = yield* fs.makeTempDirectoryScoped({ prefix: "t3-import-chosen-" });
+    const repo = path.join(root, "repo");
+    yield* fs.makeDirectory(path.join(repo, ".git"), { recursive: true });
+    yield* fs.writeFileString(path.join(repo, ".git", "config"), "[core]\n");
+    const claudeHome = path.join(root, "claude");
+    const codexHome = path.join(root, "codex");
+    const sessions = path.join(codexHome, "sessions", "2025", "06", "01");
+    yield* fs.makeDirectory(sessions, { recursive: true });
+    const nowMs = DateTime.toEpochMillis(now);
+    yield* TestClock.setTime(nowMs);
+    const file = path.join(sessions, "rollout-old.jsonl");
+    yield* fs.writeFileString(
+      file,
+      [
+        { type: "session_meta", payload: { id: "session-old", cwd: repo } },
+        { type: "event_msg", payload: { type: "user_message", message: "Old request" } },
+        {
+          type: "response_item",
+          payload: {
+            type: "message",
+            role: "assistant",
+            content: [{ type: "output_text", text: "Done" }],
+          },
+        },
+      ]
+        .map((record) => JSON.stringify(record) + "\n")
+        .join(""),
+    );
+    // Far outside the 30-day window the onboarding import uses.
+    const modifiedAtSeconds = nowMs / 1000 - 400 * 24 * 60 * 60;
+    yield* fs.utimes(file, modifiedAtSeconds, modifiedAtSeconds);
+
+    const scannerContext = yield* Layer.build(
+      AgentSessionScanner.layer.pipe(
+        Layer.provide(
+          Layer.mergeAll(
+            ServerConfig.layerTest(claudeHome, { prefix: "t3-import-chosen-config-" }),
+            ServerSettings.layerTest({
+              providerInstances: {
+                [ProviderInstanceId.make("claudeAgent")]: {
+                  driver: ProviderDriverKind.make("claudeAgent"),
+                  config: { homePath: claudeHome },
+                },
+                [ProviderInstanceId.make("codex")]: {
+                  driver: ProviderDriverKind.make("codex"),
+                  config: { homePath: codexHome },
+                },
+                [ProviderInstanceId.make("pi")]: {
+                  driver: ProviderDriverKind.make("pi"),
+                  enabled: false,
+                  config: {},
+                },
+              },
+            }),
+            Layer.mock(ProjectStore.ProjectStoreV2)({ listShells: () => Effect.succeed([]) }),
+            Layer.succeed(
+              ProviderSessionRuntime.ProviderSessionRuntimeRepository,
+              yield* ProviderSessionRuntime.ProviderSessionRuntimeRepository,
+            ),
+          ),
+        ),
+      ),
+    );
+    const scanner = Context.get(scannerContext, AgentSessionScanner.AgentSessionScanner);
+    const importer = yield* makeImporter([], Effect.void, undefined, undefined, undefined, {
+      workspaceRoot: repo,
+      scanner,
+    });
+
+    // The onboarding import keeps to its window and leaves the old session alone.
+    expect(yield* importer.run).toEqual({ importedCount: 0, skippedCount: 0 });
+    const chosen = (yield* scanner.catalogTranscripts).filter(
+      (transcript) => transcript.filePath === file,
+    );
+    expect(chosen).toHaveLength(1);
+    const threadId = ThreadId.make("import:codex:session-old");
+    expect(yield* importer.importChosen(chosen)).toEqual({
+      importedCount: 1,
+      skippedCount: 0,
+      threadIds: [threadId],
+    });
+    const thread = yield* ProjectionStore.ProjectionStoreV2.pipe(
+      Effect.flatMap((projections) => projections.getThread(threadId)),
+    );
+    expect(thread.settledOverride).toBe("active");
+    expect(thread.settledAt).toBeNull();
+    // Opening it again finds the same thread instead of importing a copy.
+    expect(yield* importer.importChosen(chosen)).toEqual({
+      importedCount: 0,
+      skippedCount: 0,
+      threadIds: [threadId],
+    });
   }).pipe(Effect.scoped, Effect.provide(Layer.merge(persistence, NodeServices.layer))),
 );

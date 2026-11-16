@@ -89,6 +89,10 @@ const MAX_IMPORT_HISTORY_BYTES = 32 * 1024 * 1024;
 const MAX_IMPORT_BYTES = 4 * 1024 * 1024 * 1024;
 const MAX_IMPORT_TRANSCRIPTS = 100;
 const MAX_IMPORT_RECORDS = 100_000;
+// The session catalog lists every transcript, so its walk is bounded only against runaway trees.
+const MAX_CATALOG_DISCOVERY_OPERATIONS_PER_SOURCE = 1_000_000;
+// Titles and cwds sit in the first records; this bounds a catalog read of a huge transcript.
+const CATALOG_PREFIX_BYTES = 256 * 1024;
 
 /**
  * open() of a file under macOS privacy protection waits on a consent prompt
@@ -230,14 +234,66 @@ export type AgentSessionRecentThread =
   | { readonly _tag: "Duplicate"; readonly source: AgentSessionImportSource }
   | { readonly _tag: "Skipped" };
 
+/** A native transcript file in a provider instance's home. */
+export interface AgentSessionTranscriptFile {
+  readonly source: AgentSessionProjectCandidate["sources"][number];
+  readonly providerInstanceId: ProviderInstanceId;
+  readonly homePath: string;
+  readonly filePath: string;
+  readonly mtimeMs: number;
+  readonly size: number;
+  readonly projectRoots?: ReadonlyArray<string> | undefined;
+}
+
+export interface AgentSessionCatalogMetadata {
+  readonly cwd: string | null;
+  readonly title: string | null;
+  readonly providerSessionId: string;
+}
+
+/** The enabled instances of a source whose homes hold its transcripts, the built-in one included. */
+export function enabledTranscriptInstances(
+  source: AgentSessionSource,
+  providerInstances: Readonly<Record<string, ProviderInstanceConfig>>,
+): Array<{ readonly instanceId: ProviderInstanceId; readonly config: ProviderInstanceConfig }> {
+  const instances = Object.entries(providerInstances)
+    .filter(
+      ([, instance]) => instance.driver === source && resolveProviderInstanceEnabled(instance),
+    )
+    .map(([instanceId, config]) => ({ instanceId: ProviderInstanceId.make(instanceId), config }));
+  if (!Object.hasOwn(providerInstances, source)) {
+    const config: ProviderInstanceConfig = { driver: ProviderDriverKind.make(source) };
+    if (resolveProviderInstanceEnabled(config)) {
+      instances.push({ instanceId: ProviderInstanceId.make(source), config });
+    }
+  }
+  return instances;
+}
+
 export class AgentSessionScanner extends Context.Service<
   AgentSessionScanner,
   {
     readonly scan: Effect.Effect<AgentSessionScanResult, AgentSessionScanError>;
+    /** Pass `chosen` to import exactly those transcripts, whatever their age. */
     readonly recentThreads: (
       workspaceRoot: string,
       completedSources?: ReadonlyArray<AgentSessionImportSource>,
+      chosen?: ReadonlyArray<AgentSessionTranscriptFile>,
     ) => Stream.Stream<AgentSessionRecentThread, AgentSessionScanError>;
+    /** Every transcript in every enabled instance's home, without the scan's caps. */
+    readonly catalogTranscripts: Effect.Effect<
+      ReadonlyArray<AgentSessionTranscriptFile>,
+      AgentSessionScanError
+    >;
+    /** Cwd, title and session ID from the start of a transcript; none for subagents. */
+    readonly readCatalogMetadata: (
+      file: AgentSessionTranscriptFile,
+    ) => Effect.Effect<Option.Option<AgentSessionCatalogMetadata>>;
+    /**
+     * The real path of the folder an import of a session run in `cwd` uses as its project: the
+     * main checkout for a linked worktree, else `cwd` itself. None when it is gone or excluded.
+     */
+    readonly resolveProjectRoot: (cwd: string) => Effect.Effect<Option.Option<string>>;
   }
 >()("t3/project/AgentSessionScanner") {}
 
@@ -763,6 +819,32 @@ function isT3ManagedWorktree(
 }
 
 // false stops metadata scanning for an excluded rollout, even if later records contain a cwd.
+/** The provider's session ID from one Claude record or Codex session_meta line, if it names one. */
+function extractNativeSessionId(line: string, source: AgentSessionSource): string | null {
+  if (source === "pi") return null;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(line);
+  } catch {
+    return null;
+  }
+  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) return null;
+  const record = parsed as Record<string, unknown>;
+  if (source === "claudeAgent") {
+    return typeof record.sessionId === "string" && record.sessionId.trim().length > 0
+      ? record.sessionId.trim()
+      : null;
+  }
+  if (record.type !== "session_meta") return null;
+  const payload = record.payload;
+  if (typeof payload !== "object" || payload === null) return null;
+  for (const key of ["id", "session_id"]) {
+    const value = (payload as Record<string, unknown>)[key];
+    if (typeof value === "string" && value.trim().length > 0) return value.trim();
+  }
+  return null;
+}
+
 function extractCwd(line: string, source: AgentSessionSource): string | null | false {
   let parsed: unknown;
   try {
@@ -1706,53 +1788,14 @@ export const make = Effect.gen(function* () {
     }));
   });
 
-  const collectCandidates = Effect.fn("AgentSessionScanner.collectCandidates")(function* () {
-    const settings = yield* serverSettings.getSettings.pipe(
-      Effect.mapError((cause) => new AgentSessionScanError({ operation: "read-settings", cause })),
-    );
-
-    const runtimeRows = yield* runtimes
-      .list()
-      .pipe(
-        Effect.mapError(
-          (cause) => new AgentSessionScanError({ operation: "read-projects", cause }),
-        ),
-      );
-    const importedByFile = Map.groupBy(
-      runtimeRows.flatMap((runtime) => {
-        const payload = decodeImportedTranscriptPayload(runtime.runtimePayload);
-        if (Option.isNone(payload) || payload.value.cwd === undefined) return [];
-        const cwd = payload.value.cwd;
-        return (payload.value.importedTranscripts ?? []).map((source) => ({ cwd, source }));
-      }),
-      ({ source }) => `${source.providerInstanceId}\0${source.filePath}`,
-    );
-    const raw: Array<RawCandidate> = [];
-    let truncated = false;
-    let metadataTruncated = false;
-
-    for (const source of ["claudeAgent", "codex", "pi"] as const) {
-      const instances: Array<{
-        readonly instanceId: ProviderInstanceId;
-        readonly config: ProviderInstanceConfig;
-      }> = Object.entries(settings.providerInstances)
-        .filter(
-          ([, instance]) => instance.driver === source && resolveProviderInstanceEnabled(instance),
-        )
-        .map(([instanceId, config]) => ({
-          instanceId: ProviderInstanceId.make(instanceId),
-          config,
-        }));
-      if (!Object.hasOwn(settings.providerInstances, source)) {
-        const defaultInstance = {
-          instanceId: ProviderInstanceId.make(source),
-          config: { driver: ProviderDriverKind.make(source) },
-        };
-        if (resolveProviderInstanceEnabled(defaultInstance.config)) {
-          instances.push(defaultInstance);
-        }
-      }
-
+  /** Every transcript in the source's homes, one home per enabled provider instance. */
+  const discoverSourceTranscripts = Effect.fn("AgentSessionScanner.discoverSourceTranscripts")(
+    function* (
+      source: AgentSessionSource,
+      providerInstances: Readonly<Record<string, ProviderInstanceConfig>>,
+      operationBudgetTotal: number,
+    ) {
+      const instances = [...enabledTranscriptInstances(source, providerInstances)];
       instances.sort((left, right) => {
         const leftDefault = left.instanceId === source ? 0 : 1;
         const rightDefault = right.instanceId === source ? 0 : 1;
@@ -1808,14 +1851,13 @@ export const make = Effect.gen(function* () {
         homes.push({ homePath, providerInstanceId: instanceId });
       }
 
-      const transcriptCandidates: Array<TranscriptCandidate> = [];
       const discover =
         source === "claudeAgent"
           ? discoverClaudeTranscripts
           : source === "codex"
             ? discoverCodexTranscripts
             : discoverPiTranscripts;
-      const shares = splitOperationBudget(MAX_DISCOVERY_OPERATIONS_PER_SOURCE, homes.length);
+      const shares = splitOperationBudget(operationBudgetTotal, homes.length);
       const discovered: Array<{
         readonly transcripts: ReadonlyArray<TranscriptCandidate>;
         readonly truncated: boolean;
@@ -1833,7 +1875,7 @@ export const make = Effect.gen(function* () {
       // Each takes an even split of what is still unused; a pass in which no home finishes spends
       // it all, so every repeat has fewer starved homes.
       let unused =
-        MAX_DISCOVERY_OPERATIONS_PER_SOURCE -
+        operationBudgetTotal -
         discovered.reduce((total, result) => total + result.operationsUsed, 0);
       let starved = discovered.flatMap((result, index) => (result.truncated ? [index] : []));
       while (unused > 0 && starved.length > 0) {
@@ -1848,10 +1890,46 @@ export const make = Effect.gen(function* () {
         }
         starved = starved.filter((index) => discovered[index]!.truncated);
       }
-      for (const result of discovered) {
-        truncated ||= result.truncated;
-        transcriptCandidates.push(...result.transcripts);
-      }
+      return {
+        transcripts: discovered.flatMap((result) => result.transcripts),
+        truncated: discovered.some((result) => result.truncated),
+      };
+    },
+  );
+
+  const collectCandidates = Effect.fn("AgentSessionScanner.collectCandidates")(function* () {
+    const settings = yield* serverSettings.getSettings.pipe(
+      Effect.mapError((cause) => new AgentSessionScanError({ operation: "read-settings", cause })),
+    );
+
+    const runtimeRows = yield* runtimes
+      .list()
+      .pipe(
+        Effect.mapError(
+          (cause) => new AgentSessionScanError({ operation: "read-projects", cause }),
+        ),
+      );
+    const importedByFile = Map.groupBy(
+      runtimeRows.flatMap((runtime) => {
+        const payload = decodeImportedTranscriptPayload(runtime.runtimePayload);
+        if (Option.isNone(payload) || payload.value.cwd === undefined) return [];
+        const cwd = payload.value.cwd;
+        return (payload.value.importedTranscripts ?? []).map((source) => ({ cwd, source }));
+      }),
+      ({ source }) => `${source.providerInstanceId}\0${source.filePath}`,
+    );
+    const raw: Array<RawCandidate> = [];
+    let truncated = false;
+    let metadataTruncated = false;
+
+    for (const source of ["claudeAgent", "codex", "pi"] as const) {
+      const discovery = yield* discoverSourceTranscripts(
+        source,
+        settings.providerInstances,
+        MAX_DISCOVERY_OPERATIONS_PER_SOURCE,
+      );
+      truncated ||= discovery.truncated;
+      const transcriptCandidates = [...discovery.transcripts];
 
       transcriptCandidates.sort(
         (left, right) =>
@@ -1984,6 +2062,7 @@ export const make = Effect.gen(function* () {
   const prepareRecentThreads = Effect.fn("AgentSessionScanner.prepareRecentThreads")(function* (
     workspaceRoot: string,
     completedSources: ReadonlyArray<AgentSessionImportSource>,
+    chosen: ReadonlyArray<AgentSessionTranscriptFile> | undefined,
   ) {
     const root = path.resolve(expandHomePath(workspaceRoot, homeDir));
     const realRoot = yield* fileSystem.realPath(root).pipe(Effect.orElseSucceed(() => root));
@@ -1992,11 +2071,12 @@ export const make = Effect.gen(function* () {
     const nowMs = DateTime.toEpochMillis(yield* DateTime.now);
     const cutoffMs = nowMs - RECENT_THREAD_WINDOW_MS;
 
-    // Imports recorded since a budget-truncated collection can free budget for transcripts it cut off.
-    if (cachedCandidates === null || cachedCandidates.metadataTruncated) {
+    // Chosen transcripts skip the scan; an earlier scan still helps find Codex history bases.
+    if (chosen === undefined && (cachedCandidates === null || cachedCandidates.metadataTruncated)) {
+      // Imports recorded since a budget-truncated collection can free budget for transcripts it cut off.
       cachedCandidates = yield* collectCandidates();
     }
-    const { candidates } = cachedCandidates;
+    const candidates = cachedCandidates?.candidates ?? [];
 
     // The scan counts a linked worktree's sessions toward its main checkout, so import them with it.
     const candidateDirectories = candidates.flatMap((candidate) => {
@@ -2041,7 +2121,26 @@ export const make = Effect.gen(function* () {
       readonly candidate: RawCandidate;
       readonly transcript: RawCandidate["transcripts"][number] & { readonly mtimeMs: number };
     }> = [];
-    for (const candidate of candidates) {
+    // A chosen transcript of any age is eligible; reading it below still checks its cwd.
+    for (const file of chosen ?? []) {
+      eligibleTranscripts.push({
+        candidate: {
+          cwd: workspaceRoot,
+          source: file.source,
+          providerInstanceId: file.providerInstanceId,
+          homePath: file.homePath,
+          threadCount: 1,
+          lastActiveAtMs: file.mtimeMs,
+          transcripts: [],
+        },
+        transcript: {
+          filePath: file.filePath,
+          mtimeMs: file.mtimeMs,
+          projectRoots: file.projectRoots,
+        },
+      });
+    }
+    for (const candidate of chosen === undefined ? candidates : []) {
       const expanded = expandHomePath(candidate.cwd.trim(), homeDir);
       if (!path.isAbsolute(expanded)) continue;
       const resolved = path.resolve(expanded);
@@ -2078,24 +2177,50 @@ export const make = Effect.gen(function* () {
     let bytesRemaining = MAX_IMPORT_BYTES;
     let transcriptsRemaining = MAX_IMPORT_TRANSCRIPTS;
     const codexRolloutPaths = new Map<ProviderInstanceId, ReadonlyMap<string, string>>();
-    const codexRolloutPath = (providerInstanceId: ProviderInstanceId, rolloutId: string) => {
+    const rolloutEntry = (filePath: string) => {
+      const match = CODEX_ROLLOUT_ID_PATTERN.exec(filePath);
+      const id = match?.[2] ?? match?.[1];
+      return id === undefined ? [] : [[id, filePath] as const];
+    };
+    // A chosen import skips the scan, so it finds inherited rollouts by walking the Codex homes.
+    let chosenCodexTranscripts: ReadonlyArray<TranscriptCandidate> | null = null;
+    const codexRolloutPath = Effect.fn("AgentSessionScanner.codexRolloutPath")(function* (
+      providerInstanceId: ProviderInstanceId,
+      rolloutId: string,
+    ) {
       let paths = codexRolloutPaths.get(providerInstanceId);
       if (paths === undefined) {
-        paths = new Map(
-          candidates.flatMap((candidate) =>
-            candidate.source === "codex" && candidate.providerInstanceId === providerInstanceId
-              ? candidate.transcripts.flatMap((transcript) => {
-                  const match = CODEX_ROLLOUT_ID_PATTERN.exec(transcript.filePath);
-                  const id = match?.[2] ?? match?.[1];
-                  return id === undefined ? [] : [[id, transcript.filePath] as const];
-                })
-              : [],
-          ),
-        );
+        if (chosen === undefined) {
+          paths = new Map(
+            candidates.flatMap((candidate) =>
+              candidate.source === "codex" && candidate.providerInstanceId === providerInstanceId
+                ? candidate.transcripts.flatMap((transcript) => rolloutEntry(transcript.filePath))
+                : [],
+            ),
+          );
+        } else {
+          if (chosenCodexTranscripts === null) {
+            const settings = yield* serverSettings.getSettings.pipe(Effect.option);
+            chosenCodexTranscripts = Option.isNone(settings)
+              ? []
+              : (yield* discoverSourceTranscripts(
+                  "codex",
+                  settings.value.providerInstances,
+                  MAX_CATALOG_DISCOVERY_OPERATIONS_PER_SOURCE,
+                )).transcripts;
+          }
+          paths = new Map(
+            chosenCodexTranscripts.flatMap((transcript) =>
+              transcript.providerInstanceId === providerInstanceId
+                ? rolloutEntry(transcript.filePath)
+                : [],
+            ),
+          );
+        }
         codexRolloutPaths.set(providerInstanceId, paths);
       }
       return paths.get(rolloutId);
-    };
+    });
     // Reads the prefixes a rewound rollout inherits, oldest first. Without all of
     // them the rollout is imported on its own, as before.
     const readCodexHistoryBase = Effect.fn("AgentSessionScanner.readCodexHistoryBase")(function* (
@@ -2108,7 +2233,7 @@ export const make = Effect.gen(function* () {
       for (let base = codexHistoryBase(records); base !== undefined;) {
         const filePath = visited.has(base.thread_id)
           ? undefined
-          : codexRolloutPath(providerInstanceId, base.thread_id);
+          : yield* codexRolloutPath(providerInstanceId, base.thread_id);
         if (filePath === undefined || base.end_byte_offset > bytesRemaining) return null;
         visited.add(base.thread_id);
         const stats = yield* statOption(filePath);
@@ -2256,9 +2381,116 @@ export const make = Effect.gen(function* () {
   const recentThreads: AgentSessionScanner["Service"]["recentThreads"] = (
     workspaceRoot,
     completedSources = [],
-  ) => Stream.unwrap(prepareRecentThreads(workspaceRoot, completedSources));
+    chosen,
+  ) => Stream.unwrap(prepareRecentThreads(workspaceRoot, completedSources, chosen));
 
-  return AgentSessionScanner.of({ scan, recentThreads });
+  const catalogTranscripts: AgentSessionScanner["Service"]["catalogTranscripts"] = Effect.gen(
+    function* () {
+      const settings = yield* serverSettings.getSettings.pipe(
+        Effect.mapError(
+          (cause) => new AgentSessionScanError({ operation: "read-settings", cause }),
+        ),
+      );
+      const files: Array<AgentSessionTranscriptFile> = [];
+      for (const source of ["claudeAgent", "codex", "pi"] as const) {
+        const discovery = yield* discoverSourceTranscripts(
+          source,
+          settings.providerInstances,
+          MAX_CATALOG_DISCOVERY_OPERATIONS_PER_SOURCE,
+        );
+        for (const transcript of discovery.transcripts) {
+          files.push({
+            source,
+            providerInstanceId: transcript.providerInstanceId,
+            homePath: transcript.homePath,
+            filePath: transcript.filePath,
+            mtimeMs: transcript.mtimeMs,
+            size: transcript.identity.size,
+            projectRoots: transcript.projectRoots,
+          });
+        }
+      }
+      return files;
+    },
+  );
+
+  const readCatalogMetadata = Effect.fn("AgentSessionScanner.readCatalogMetadata")(function* (
+    file: AgentSessionTranscriptFile,
+  ) {
+    const prefix = yield* Effect.scoped(
+      fileSystem.open(file.filePath, { flag: "r" }).pipe(
+        Effect.flatMap((handle) =>
+          Effect.gen(function* () {
+            const readChunk = yield* transcriptChunkReader(handle, file.filePath);
+            const decoder = new TextDecoder();
+            let text = "";
+            let bytesRead = 0;
+            while (bytesRead < CATALOG_PREFIX_BYTES) {
+              const chunk = yield* readChunk(
+                Math.min(TRANSCRIPT_PREFIX_BYTES, CATALOG_PREFIX_BYTES - bytesRead),
+              );
+              if (Option.isNone(chunk) || chunk.value.byteLength === 0) break;
+              bytesRead += chunk.value.byteLength;
+              text += decoder.decode(chunk.value, { stream: true });
+            }
+            return text;
+          }),
+        ),
+      ),
+    ).pipe(Effect.option);
+    if (Option.isNone(prefix)) return Option.none<AgentSessionCatalogMetadata>();
+    // The prefix can end mid-record, so only complete lines are parsed.
+    const contents = prefix.value.slice(0, prefix.value.lastIndexOf("\n") + 1);
+    let cwd: string | null = null;
+    let nativeSessionId: string | null = null;
+    for (const line of contents.split("\n")) {
+      if (cwd === null) {
+        const found = extractCwd(line, file.source);
+        if (found === false) return Option.none<AgentSessionCatalogMetadata>();
+        if (found !== null) cwd = projectCwd(found, file.projectRoots);
+      }
+      nativeSessionId ??= extractNativeSessionId(line, file.source);
+      if (cwd !== null && nativeSessionId !== null) break;
+    }
+    const fallbackSessionId = path.basename(
+      file.filePath,
+      isCompressedTranscript(file.filePath) ? COMPRESSED_TRANSCRIPT_SUFFIX : ".jsonl",
+    );
+    const thread = parseAgentSessionTranscript({
+      source: file.source,
+      providerInstanceId: file.providerInstanceId,
+      fallbackSessionId,
+      lastActiveAtMs: file.mtimeMs,
+      contents,
+    });
+    return Option.some<AgentSessionCatalogMetadata>({
+      cwd,
+      title: thread?.title ?? null,
+      // A long first prompt can leave no whole message in the prefix; the metadata still names it.
+      providerSessionId: nativeSessionId ?? thread?.providerSessionId ?? fallbackSessionId,
+    });
+  });
+
+  const resolveProjectRoot = Effect.fn("AgentSessionScanner.resolveProjectRoot")(function* (
+    cwd: string,
+  ) {
+    const expanded = expandHomePath(cwd.trim(), homeDir);
+    if (!path.isAbsolute(expanded)) return Option.none<string>();
+    const resolved = path.resolve(expanded);
+    const project = (yield* resolveDirectoryProjects([resolved])).get(resolved) ?? null;
+    if (project === null) return Option.none<string>();
+    return Option.some(
+      yield* fileSystem.realPath(project.path).pipe(Effect.orElseSucceed(() => project.path)),
+    );
+  });
+
+  return AgentSessionScanner.of({
+    scan,
+    recentThreads,
+    catalogTranscripts,
+    readCatalogMetadata,
+    resolveProjectRoot,
+  });
 });
 
 export const layer = Layer.effect(AgentSessionScanner, make).pipe(

@@ -540,6 +540,15 @@ export const SETTINGS_SEARCH_ITEMS = [
     searchTerms: ["beta fast worktree checkout clone apfs copy-on-write cache macos speed"],
   },
   {
+    id: "external-sessions",
+    title: "External sessions",
+    to: "/settings/labs",
+    scope: "environment",
+    searchTerms: [
+      "beta external history outside terminal import transcripts claude codex pi sessions ghost catalog resume",
+    ],
+  },
+  {
     id: "voice-transcription-destination",
     title: "Transcribe with",
     to: "/settings/voice",

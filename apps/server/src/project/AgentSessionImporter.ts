@@ -207,7 +207,15 @@ const make = Effect.gen(function* () {
   const ceiling = settingsService.managedPolicy?.limits?.maxRuntimeMode;
   const importRecentAgentThreads = Effect.fn("importRecentAgentThreadsV2")(function* (
     input: AgentSessionImportInput,
+    options?: {
+      /** Import exactly these transcripts, whatever their age, instead of recent ones. */
+      readonly chosen?: ReadonlyArray<AgentSessionScanner.AgentSessionTranscriptFile>;
+      /** Create the threads active rather than settled, as work to continue now. */
+      readonly active?: boolean;
+    },
   ) {
+    const active = options?.active === true;
+    const importedAt = yield* DateTime.now;
     const project = yield* projects.getById(input.projectId).pipe(
       Effect.mapError((cause) => new AgentSessionScanError({ operation: "read-projects", cause })),
       Effect.flatMap(
@@ -262,7 +270,11 @@ const make = Effect.gen(function* () {
         ),
       );
     })).flat();
-    const outcomes = scanner.recentThreads(project.workspaceRoot, completedSources);
+    const outcomes = scanner.recentThreads(
+      project.workspaceRoot,
+      completedSources,
+      options?.chosen,
+    );
     const importedThreadIds = new Set<ThreadId>();
     let importedCount = 0;
     let skippedCount = 0;
@@ -386,9 +398,9 @@ const make = Effect.gen(function* () {
             createdAt,
             updatedAt,
             archivedAt: null,
-            settledOverride: "settled",
-            settledAt: updatedAt,
-            unsettledAt: null,
+            settledOverride: active ? "active" : "settled",
+            settledAt: active ? null : updatedAt,
+            unsettledAt: active ? importedAt : null,
             snoozedUntil: null,
             snoozedAt: null,
             pinnedAt: null,
@@ -495,7 +507,12 @@ const make = Effect.gen(function* () {
       }),
     );
 
-    return { importedCount, skippedCount } satisfies AgentSessionImportResult;
+    // A chosen import names its threads so the caller can open them.
+    return {
+      importedCount,
+      skippedCount,
+      ...(options?.chosen === undefined ? {} : { threadIds: Array.from(importedThreadIds) }),
+    } satisfies AgentSessionImportResult;
   });
 
   /**

@@ -19,6 +19,7 @@ import { stackedThreadToast, toastManager } from "../ui/toast";
 import { SettingsPageContainer, SettingsRow, SettingsSection } from "./settingsLayout";
 import { searchableSetting } from "./settingsSearch";
 import { ProjectFavicon } from "../ProjectFavicon";
+import { BanishedSessionsSection } from "./BanishedSessionsSection";
 
 import { useRef, useState } from "react";
 import { Tooltip, TooltipTrigger, TooltipPopup } from "../ui/tooltip";
@@ -270,6 +271,7 @@ export function ArchivedThreadsPanel() {
           </SettingsSection>
         ))
       )}
+      <BanishedSessionsSection />
     </SettingsPageContainer>
   );
 }
