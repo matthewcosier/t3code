@@ -784,15 +784,19 @@ it.effect("lists, opens and imports nothing and keeps no index while the setting
       groupCounts: [],
       revision: 0,
       listing: "",
+      importing: null,
     });
     expect((yield* harness.catalog.banish({ kind: "olderThan", months: 1 })).count).toBe(0);
     const refused = yield* harness.catalog
       .hydrate({ providerInstanceId: claude, filePath })
       .pipe(Effect.flip);
     expect(refused).toMatchObject({ _tag: "AgentSessionHydrateError", reason: "disabled" });
-    expect(yield* harness.catalog.importRecent({ activeFrom: "2026-01-01T00:00:00.000Z" })).toEqual(
-      { importedCount: 0, skippedCount: 0 },
-    );
+    expect(
+      yield* harness.catalog.importSessions({
+        sessions: [],
+        windows: [{ activeFrom: "2026-01-01T00:00:00.000Z" }],
+      }),
+    ).toMatchObject({ importedCount: 0, skippedCount: 0 });
     expect(harness.imports).toEqual([]);
     expect(yield* fs.exists(path.join(harness.stateDir, "agent-session-catalog.sqlite"))).toBe(
       false,
@@ -895,10 +899,13 @@ it.effect(
       yield* fs.remove(deleted);
 
       const activeFrom = DateTime.formatIso(DateTime.makeUnsafe(nowMs - 30 * DAY_MS));
-      const result = yield* harness.catalog.importRecent({ activeFrom });
+      const result = yield* harness.catalog.importSessions({
+        sessions: [],
+        windows: [{ activeFrom }],
+      });
 
       // The three listed sessions inside the window become threads; the deleted one is skipped.
-      expect(result).toEqual({ importedCount: 3, skippedCount: 1 });
+      expect(result).toMatchObject({ importedCount: 3, skippedCount: 1 });
       for (const index of [1, 2, 7]) {
         const threadId = ThreadId.make(
           `import:${claude}:0b6f1d5e-9999-4aaa-8bbb-00000000000${index}`,
@@ -921,11 +928,282 @@ it.effect(
       ]);
 
       // A second import finds nothing left to take.
-      expect(yield* harness.catalog.importRecent({ activeFrom })).toEqual({
+      expect(
+        yield* harness.catalog.importSessions({ sessions: [], windows: [{ activeFrom }] }),
+      ).toMatchObject({
         importedCount: 0,
         skippedCount: 0,
       });
     }).pipe(Effect.scoped, Effect.provide(Layer.merge(persistence, NodeServices.layer))),
+);
+
+it.effect("imports the chosen sessions the list shows, whatever their age, and nothing else", () =>
+  Effect.gen(function* () {
+    const harness = yield* makeHarness({ realImporter: true });
+    const app = yield* harness.makeWorkspace("app");
+    const write = (index: number, request: string, ageDays: number) =>
+      harness.writeClaude({
+        cwd: app,
+        sessionId: `0b6f1d5e-cccc-4aaa-8bbb-00000000000${index}`,
+        request,
+        ageDays,
+      });
+    const recent = yield* write(1, "Chosen yesterday", 1);
+    const old = yield* write(2, "Chosen last year", 400);
+    yield* write(3, "Not chosen", 5);
+    const banished = yield* write(4, "Chosen but banished", 10);
+    const opened = yield* write(5, "Chosen but opened", 20);
+    yield* harness.catalog.index;
+    yield* harness.catalog.banish({
+      kind: "sessions",
+      sessions: [{ providerInstanceId: claude, filePath: banished }],
+    });
+    yield* harness.catalog.hydrate({ providerInstanceId: claude, filePath: opened });
+
+    const chosen = [recent, old, banished, opened].map((filePath) => ({
+      providerInstanceId: claude,
+      filePath,
+    }));
+    // A banished session and one a thread holds are not on the list, so choosing them takes nothing.
+    expect(yield* harness.catalog.importSessions({ sessions: chosen })).toMatchObject({
+      importedCount: 2,
+      skippedCount: 0,
+    });
+    for (const index of [1, 2]) {
+      const threadId = ThreadId.make(
+        `import:${claude}:0b6f1d5e-cccc-4aaa-8bbb-00000000000${index}`,
+      );
+      const records = yield* harness.projections.getThreadRecords(threadId, []);
+      expect(records.thread.settledOverride).toBe("settled");
+    }
+    expect(titles(yield* harness.catalog.list({}))).toEqual(["Not chosen"]);
+    expect((yield* harness.catalog.banished({})).entries.map((entry) => entry.title)).toEqual([
+      "Chosen but banished",
+    ]);
+  }).pipe(Effect.scoped, Effect.provide(Layer.merge(persistence, NodeServices.layer))),
+);
+
+it.effect("narrows the list, its counts, banishing, importing and restoring to a filter", () =>
+  Effect.gen(function* () {
+    const harness = yield* makeHarness({ realImporter: true });
+    const billing = yield* harness.makeWorkspace("billing");
+    const docs = yield* harness.makeWorkspace("docs");
+    const write = (index: number, cwd: string, request: string, ageDays: number) =>
+      harness.writeClaude({
+        cwd,
+        sessionId: `0b6f1d5e-dddd-4aaa-8bbb-00000000000${index}`,
+        request,
+        ageDays,
+      });
+    yield* write(1, billing, "Fix the refund rounding", 2);
+    yield* write(2, docs, "Rewrite the README", 3);
+    yield* write(3, billing, "Old invoice export", 200);
+    yield* write(4, docs, "Old style guide", 300);
+    yield* harness.catalog.index;
+
+    // The text matches a title or the folder, whatever its case; the tool narrows too.
+    const billingOnly = { search: "BILLING" };
+    expect(titles(yield* harness.catalog.list({ filter: billingOnly }))).toEqual([
+      "Fix the refund rounding",
+      "Old invoice export",
+    ]);
+    expect(titles(yield* harness.catalog.list({ filter: { search: "readme" } }))).toEqual([
+      "Rewrite the README",
+    ]);
+    expect(
+      (yield* harness.catalog.list({ filter: { sources: ["codex"] }, limit: 0 })).totalCount,
+    ).toBe(0);
+    // The presets count, and banish, only what the filter shows.
+    const filtered = yield* harness.catalog.list({ filter: billingOnly, limit: 0 });
+    expect(filtered.olderThan.find((preset) => preset.months === 3)?.count).toBe(1);
+    expect(
+      (yield* harness.catalog.banish({ kind: "olderThan", months: 3, filter: billingOnly })).count,
+    ).toBe(1);
+    expect(titles(yield* harness.catalog.list({}))).toEqual([
+      "Fix the refund rounding",
+      "Rewrite the README",
+      "Old style guide",
+    ]);
+    // An import of a window takes only what the filter shows in it.
+    const activeFrom = DateTime.formatIso(DateTime.makeUnsafe(nowMs - 30 * DAY_MS));
+    expect(
+      yield* harness.catalog.importSessions({
+        sessions: [],
+        windows: [{ activeFrom }],
+        filter: billingOnly,
+      }),
+    ).toMatchObject({ importedCount: 1, skippedCount: 0 });
+    expect(titles(yield* harness.catalog.list({}))).toEqual([
+      "Rewrite the README",
+      "Old style guide",
+    ]);
+    // Restoring every banished session under a filter leaves the others banished.
+    yield* harness.catalog.banish({ kind: "olderThan", months: 3 });
+    expect((yield* harness.catalog.banished({ filter: billingOnly })).totalCount).toBe(1);
+    expect(
+      (yield* harness.catalog.restore({ kind: "banished", filter: { search: "style" } })).count,
+    ).toBe(1);
+    expect((yield* harness.catalog.banished({})).entries.map((entry) => entry.title)).toEqual([
+      "Old invoice export",
+    ]);
+    expect((yield* harness.catalog.restore({ kind: "banished" })).count).toBe(1);
+    expect((yield* harness.catalog.banished({})).totalCount).toBe(0);
+  }).pipe(Effect.scoped, Effect.provide(Layer.merge(persistence, NodeServices.layer))),
+);
+
+it.effect(
+  "takes whole groups less the excluded sessions, names the threads made and shows progress",
+  () =>
+    Effect.gen(function* () {
+      // Lists between import write transactions, to see the progress an import reports.
+      let duringImport: Effect.Effect<void> = Effect.void;
+      const harness = yield* makeHarness({
+        realImporter: true,
+        beforeImportTransaction: Effect.suspend(() => duringImport),
+      });
+      const app = yield* harness.makeWorkspace("app");
+      const sessionId = (index: number) => `0b6f1d5e-eeee-4aaa-8bbb-00000000000${index}`;
+      const write = (index: number, request: string, ageDays: number) =>
+        harness.writeClaude({ cwd: app, sessionId: sessionId(index), request, ageDays });
+      yield* write(1, "In the week", 2);
+      const excluded = yield* write(2, "In the week, left out", 3);
+      yield* write(3, "Before the week", 20);
+      yield* harness.catalog.index;
+      const seen: Array<{ readonly done: number; readonly total: number } | null> = [];
+      duringImport = harness.catalog.list({ limit: 0 }).pipe(
+        Effect.map((answer) => seen.push(answer.importing)),
+        Effect.asVoid,
+        Effect.orDie,
+      );
+
+      const week = DateTime.formatIso(DateTime.makeUnsafe(nowMs - 7 * DAY_MS));
+      const result = yield* harness.catalog.importSessions({
+        sessions: [],
+        windows: [{ activeFrom: week }],
+        exclude: [{ providerInstanceId: claude, filePath: excluded }],
+      });
+      expect(result).toEqual({
+        importedCount: 1,
+        skippedCount: 0,
+        threadIds: [ThreadId.make(`import:${claude}:${sessionId(1)}`)],
+      });
+      expect(titles(yield* harness.catalog.list({}))).toEqual([
+        "In the week, left out",
+        "Before the week",
+      ]);
+      // While it ran, every answer said how far it had got; afterwards none does.
+      expect(seen.length).toBeGreaterThan(0);
+      expect(seen.every((progress) => progress !== null && progress.total === 1)).toBe(true);
+      expect((yield* harness.catalog.list({ limit: 0 })).importing).toBeNull();
+
+      // Banishing takes a window less the excluded in the same way.
+      expect(
+        (yield* harness.catalog.banish({
+          kind: "sessions",
+          sessions: [],
+          windows: [{ activeUntil: week }],
+          exclude: [],
+        })).count,
+      ).toBe(1);
+      expect(titles(yield* harness.catalog.list({}))).toEqual(["In the week, left out"]);
+    }).pipe(Effect.scoped, Effect.provide(Layer.merge(persistence, NodeServices.layer))),
+);
+
+it.effect("does not list a session with no conversation until one starts in it", () =>
+  Effect.gen(function* () {
+    const fs = yield* FileSystem.FileSystem;
+    const harness = yield* makeHarness();
+    const app = yield* harness.makeWorkspace("app");
+    const sessionId = "0b6f1d5e-ffff-4aaa-8bbb-000000000001";
+    const filePath = yield* harness.writeClaude({
+      cwd: app,
+      sessionId,
+      request: "Talk",
+      ageDays: 1,
+    });
+    // Only a record that names the session and its folder: nothing was said in it.
+    yield* fs.writeFileString(
+      filePath,
+      JSON.stringify({ type: "system", cwd: app, sessionId, timestamp }) + "\n",
+    );
+    yield* harness.catalog.index;
+    expect((yield* harness.catalog.list({ limit: 0 })).totalCount).toBe(0);
+
+    // Once a conversation is in it, the next pass lists it.
+    yield* fs.writeFileString(filePath, claudeTranscript(app, sessionId, "Now it talks"));
+    yield* harness.catalog.index;
+    expect(titles(yield* harness.catalog.list({}))).toEqual(["Now it talks"]);
+  }).pipe(Effect.scoped, Effect.provide(Layer.merge(persistence, NodeServices.layer))),
+);
+
+it.effect("previews the start of a conversation without making a project or a thread", () =>
+  Effect.gen(function* () {
+    const fs = yield* FileSystem.FileSystem;
+    const harness = yield* makeHarness({ realImporter: true });
+    const app = yield* harness.makeWorkspace("app");
+    const filePath = yield* harness.writeClaude({
+      cwd: app,
+      sessionId: "0b6f1d5e-9191-4aaa-8bbb-000000000001",
+      request: "What does the payout job do?",
+      ageDays: 1,
+    });
+    yield* harness.catalog.index;
+
+    const preview = yield* harness.catalog.preview({ providerInstanceId: claude, filePath });
+    expect(preview).toEqual({
+      messages: [
+        { role: "user", text: "What does the payout job do?" },
+        { role: "assistant", text: "Done" },
+      ],
+      more: false,
+    });
+    expect(harness.bootstraps).toEqual([]);
+    // Still listed: a preview opens nothing.
+    expect(titles(yield* harness.catalog.list({}))).toEqual(["What does the payout job do?"]);
+
+    // A conversation too long to hold whole shows only its opening request, never its opening
+    // request followed by its latest messages as if they came next.
+    const longSession = "0b6f1d5e-9191-4aaa-8bbb-000000000002";
+    const longPath = yield* harness.writeClaude({
+      cwd: app,
+      sessionId: longSession,
+      request: "Start the ledger rewrite",
+      ageDays: 2,
+    });
+    const turns = Array.from({ length: 400 }, (_, index) =>
+      index % 2 === 0
+        ? {
+            type: "assistant",
+            sessionId: longSession,
+            timestamp,
+            message: { role: "assistant", content: [{ type: "text", text: `Reply ${index}` }] },
+          }
+        : {
+            type: "user",
+            cwd: app,
+            sessionId: longSession,
+            timestamp,
+            message: { role: "user", content: `Request ${index}` },
+          },
+    );
+    yield* fs.writeFileString(
+      longPath,
+      (yield* fs.readFileString(longPath)) +
+        turns.map((record) => JSON.stringify(record) + "\n").join(""),
+    );
+    yield* harness.catalog.index;
+    const long = yield* harness.catalog.preview({ providerInstanceId: claude, filePath: longPath });
+    expect(long).toEqual({
+      messages: [{ role: "user", text: "Start the ledger rewrite" }],
+      more: true,
+    });
+
+    yield* fs.remove(filePath);
+    const refused = yield* harness.catalog
+      .preview({ providerInstanceId: claude, filePath })
+      .pipe(Effect.flip);
+    expect(refused).toMatchObject({ _tag: "AgentSessionHydrateError", reason: "not-found" });
+  }).pipe(Effect.scoped, Effect.provide(Layer.merge(persistence, NodeServices.layer))),
 );
 
 it.effect(
@@ -954,7 +1232,9 @@ it.effect(
       expect((yield* harness.catalog.list({ limit: 0 })).totalCount).toBe(sessions + 1);
 
       const activeFrom = DateTime.formatIso(DateTime.makeUnsafe(nowMs - 30 * DAY_MS));
-      expect(yield* harness.catalog.importRecent({ activeFrom })).toEqual({
+      expect(
+        yield* harness.catalog.importSessions({ sessions: [], windows: [{ activeFrom }] }),
+      ).toMatchObject({
         importedCount: sessions,
         skippedCount: 1,
       });
@@ -995,7 +1275,9 @@ it.effect(
       }).pipe(Effect.orDie);
 
       const activeFrom = DateTime.formatIso(DateTime.makeUnsafe(nowMs - 30 * DAY_MS));
-      expect(yield* harness.catalog.importRecent({ activeFrom })).toEqual({
+      expect(
+        yield* harness.catalog.importSessions({ sessions: [], windows: [{ activeFrom }] }),
+      ).toMatchObject({
         importedCount: 2,
         skippedCount: 1,
       });

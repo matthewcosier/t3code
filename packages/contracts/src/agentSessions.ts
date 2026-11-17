@@ -110,6 +110,22 @@ export const AgentSessionCatalogCursor = Schema.Struct({
 });
 export type AgentSessionCatalogCursor = typeof AgentSessionCatalogCursor.Type;
 
+/** Narrows every list, banish, import and restore to the sessions that match it. */
+export const AgentSessionFilter = Schema.Struct({
+  /** Text found, whatever its case, in the session's title or the folder it ran in. */
+  search: Schema.optional(Schema.String),
+  /** Only sessions these tools ran. */
+  sources: Schema.optional(Schema.Array(AgentSessionSource)),
+});
+export type AgentSessionFilter = typeof AgentSessionFilter.Type;
+
+/** A span of last activity: at or after `activeFrom` and before `activeUntil`, either open. */
+export const AgentSessionWindow = Schema.Struct({
+  activeFrom: Schema.optional(IsoDateTime),
+  activeUntil: Schema.optional(IsoDateTime),
+});
+export type AgentSessionWindow = typeof AgentSessionWindow.Type;
+
 /** The most entries one catalog page returns, whatever `limit` asks for. */
 export const AGENT_SESSION_CATALOG_MAX_PAGE_SIZE = 200;
 /** The most spans one catalog read counts sessions in. */
@@ -140,6 +156,7 @@ export const AgentSessionCatalogInput = Schema.Struct({
   limit: Schema.optional(NonNegativeInt),
   /** Start indexing new and changed transcripts when the last pass is stale. */
   refresh: Schema.optional(Schema.Boolean),
+  filter: Schema.optional(AgentSessionFilter),
 });
 export type AgentSessionCatalogInput = typeof AgentSessionCatalogInput.Type;
 
@@ -166,6 +183,8 @@ export const AgentSessionCatalogResult = Schema.Struct({
    * the same sessions.
    */
   listing: Schema.String,
+  /** How far an import running on this server has got, from any window; null when none runs. */
+  importing: Schema.NullOr(Schema.Struct({ done: NonNegativeInt, total: NonNegativeInt })),
 });
 export type AgentSessionCatalogResult = typeof AgentSessionCatalogResult.Type;
 
@@ -176,17 +195,35 @@ export const AgentSessionRef = Schema.Struct({
 });
 export type AgentSessionRef = typeof AgentSessionRef.Type;
 
+/** The most windows one choice can name: one per group the list shows. */
+const AGENT_SESSION_MAX_WINDOWS = AGENT_SESSION_CATALOG_MAX_GROUP_BOUNDS + 1;
+
 /**
- * Takes sessions out of the External sessions list into its banished list: chosen ones, or every
+ * Sessions picked on the list: the chosen ones and every one in the windows (whole groups), less
+ * the excluded, among those matching the filter. Only sessions the list shows are taken: none a
+ * thread holds, none banished.
+ */
+const AgentSessionChoiceFields = {
+  sessions: Schema.Array(AgentSessionRef),
+  windows: Schema.optional(
+    Schema.Array(AgentSessionWindow).check(Schema.isMaxLength(AGENT_SESSION_MAX_WINDOWS)),
+  ),
+  exclude: Schema.optional(Schema.Array(AgentSessionRef)),
+  filter: Schema.optional(AgentSessionFilter),
+};
+
+/**
+ * Takes sessions out of the External sessions list into its banished list: a choice, or every
  * listed session last active more than `months` ago. A banished session comes back by itself once
  * it sees new activity.
  */
 export const AgentSessionBanishInput = Schema.Union([
-  Schema.Struct({ kind: Schema.Literal("sessions"), sessions: Schema.Array(AgentSessionRef) }),
+  Schema.Struct({ kind: Schema.Literal("sessions"), ...AgentSessionChoiceFields }),
   Schema.Struct({
     kind: Schema.Literal("olderThan"),
     months: PositiveInt,
     projectIds: Schema.optional(Schema.Array(ProjectId)),
+    filter: Schema.optional(AgentSessionFilter),
   }),
 ]);
 export type AgentSessionBanishInput = typeof AgentSessionBanishInput.Type;
@@ -201,6 +238,8 @@ export type AgentSessionBanishResult = typeof AgentSessionBanishResult.Type;
 export const AgentSessionRestoreInput = Schema.Union([
   Schema.Struct({ kind: Schema.Literal("batch"), batchId: TrimmedNonEmptyString }),
   Schema.Struct({ kind: Schema.Literal("sessions"), sessions: Schema.Array(AgentSessionRef) }),
+  /** Every banished session that matches the filter. */
+  Schema.Struct({ kind: Schema.Literal("banished"), filter: Schema.optional(AgentSessionFilter) }),
 ]);
 export type AgentSessionRestoreInput = typeof AgentSessionRestoreInput.Type;
 
@@ -211,6 +250,7 @@ export const AgentSessionBanishedInput = Schema.Struct({
   projectIds: Schema.optional(Schema.Array(ProjectId)),
   before: Schema.optional(AgentSessionCatalogCursor),
   limit: Schema.optional(PositiveInt),
+  filter: Schema.optional(AgentSessionFilter),
 });
 export type AgentSessionBanishedInput = typeof AgentSessionBanishedInput.Type;
 
@@ -227,19 +267,35 @@ export const AgentSessionBanishedResult = Schema.Struct({
 });
 export type AgentSessionBanishedResult = typeof AgentSessionBanishedResult.Type;
 
-/** Imports every listed session last active at or after `activeFrom` as a settled thread. */
-export const AgentSessionImportRecentInput = Schema.Struct({
-  activeFrom: IsoDateTime,
-  projectIds: Schema.optional(Schema.Array(ProjectId)),
-});
-export type AgentSessionImportRecentInput = typeof AgentSessionImportRecentInput.Type;
+/** Imports a choice of listed sessions as settled threads; the last 30 days is one window. */
+export const AgentSessionImportExternalInput = Schema.Struct(AgentSessionChoiceFields);
+export type AgentSessionImportExternalInput = typeof AgentSessionImportExternalInput.Type;
 
-export const AgentSessionImportRecentResult = Schema.Struct({
+export const AgentSessionImportExternalResult = Schema.Struct({
   importedCount: NonNegativeInt,
   /** Sessions that could not be imported: gone from disk, no folder to open, or unreadable. */
   skippedCount: NonNegativeInt,
+  /** The threads that now hold the imported sessions. */
+  threadIds: Schema.Array(ThreadId),
 });
-export type AgentSessionImportRecentResult = typeof AgentSessionImportRecentResult.Type;
+export type AgentSessionImportExternalResult = typeof AgentSessionImportExternalResult.Type;
+
+/** The start of a session's conversation, to see what it was before opening it. */
+export const AgentSessionPreviewInput = AgentSessionRef;
+export type AgentSessionPreviewInput = typeof AgentSessionPreviewInput.Type;
+
+/** How many messages a preview shows, and how much of each. */
+export const AGENT_SESSION_PREVIEW_MESSAGES = 4;
+export const AGENT_SESSION_PREVIEW_CHARACTERS = 600;
+
+export const AgentSessionPreviewResult = Schema.Struct({
+  messages: Schema.Array(
+    Schema.Struct({ role: Schema.Literals(["user", "assistant"]), text: Schema.String }),
+  ),
+  /** The conversation goes on past the messages shown. */
+  more: Schema.Boolean,
+});
+export type AgentSessionPreviewResult = typeof AgentSessionPreviewResult.Type;
 
 export const AgentSessionHydrateInput = Schema.Struct({
   providerInstanceId: ProviderInstanceId,

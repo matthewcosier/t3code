@@ -1,4 +1,9 @@
-import { WS_METHODS, type AgentSessionCatalogInput, type EnvironmentId } from "@t3tools/contracts";
+import {
+  WS_METHODS,
+  type AgentSessionBanishedInput,
+  type AgentSessionCatalogInput,
+  type EnvironmentId,
+} from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
 import { Atom } from "effect/reactivity";
 import {
@@ -28,9 +33,10 @@ export const agentSessionCatalog = createEnvironmentRpcQueryAtomFamily(connectio
   // back a session that has left the list.
   staleTimeMs: 0,
   idleTtlMs: 5 * 60_000,
-  // A first index of a large machine takes a while; the list fills in as it goes.
+  // A first index of a large machine takes a while, and so does a large import; the list fills in
+  // or empties as they go.
   refreshIntervalMs: 2_000,
-  isFinal: (result) => !result.indexing,
+  isFinal: (result) => !result.indexing && result.importing === null,
 });
 
 export const agentSessionCatalogPagesKey = (
@@ -73,9 +79,33 @@ export const agentSessionBanished = createEnvironmentRpcQueryAtomFamily(connecti
 });
 
 /** Imports every listed session since a time as a settled thread. */
-export const agentSessionImportRecent = createEnvironmentRpcCommand(connectionAtomRuntime, {
-  label: "environment-data:agent-sessions:import-recent",
-  tag: WS_METHODS.agentSessionsImportRecent,
+export const agentSessionImportExternal = createEnvironmentRpcCommand(connectionAtomRuntime, {
+  label: "environment-data:agent-sessions:import-external",
+  tag: WS_METHODS.agentSessionsImportExternal,
+});
+
+export const agentSessionBanishedPagesKey = (
+  environmentId: EnvironmentId,
+  inputs: ReadonlyArray<AgentSessionBanishedInput>,
+) => JSON.stringify({ environmentId, inputs });
+
+/** Every page of banished sessions shown, in order; equal page lists reuse one atom. */
+export const agentSessionBanishedPages = Atom.family((key: string) => {
+  const { environmentId, inputs } = JSON.parse(key) as {
+    readonly environmentId: EnvironmentId;
+    readonly inputs: ReadonlyArray<AgentSessionBanishedInput>;
+  };
+  return Atom.make((get) =>
+    inputs.map((input) => get(agentSessionBanished({ environmentId, input }))),
+  ).pipe(Atom.withLabel(`environment-data:agent-sessions:banished-pages:${key}`));
+});
+
+/** The start of one session's conversation, read when its preview is opened. */
+export const agentSessionPreview = createEnvironmentRpcQueryAtomFamily(connectionAtomRuntime, {
+  label: "environment-data:agent-sessions:preview",
+  tag: WS_METHODS.agentSessionsPreview,
+  staleTimeMs: 30_000,
+  idleTtlMs: 5 * 60_000,
 });
 
 export const agentSessionBanish = createEnvironmentRpcCommand(connectionAtomRuntime, {

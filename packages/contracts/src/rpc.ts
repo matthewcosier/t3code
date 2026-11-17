@@ -105,9 +105,11 @@ import {
   AgentSessionImportInput,
   AgentSessionImportProjectChangedError,
   AgentSessionImportProjectNotFoundError,
-  AgentSessionImportRecentInput,
-  AgentSessionImportRecentResult,
+  AgentSessionImportExternalInput,
+  AgentSessionImportExternalResult,
   AgentSessionImportResult,
+  AgentSessionPreviewInput,
+  AgentSessionPreviewResult,
   AgentSessionScanInput,
   AgentSessionScanResult,
   AgentSessionScanError,
@@ -450,7 +452,8 @@ export const WS_METHODS = {
   agentSessionsBanish: "agentSessions.banish",
   agentSessionsRestore: "agentSessions.restore",
   agentSessionsBanished: "agentSessions.banished",
-  agentSessionsImportRecent: "agentSessions.importRecent",
+  agentSessionsImportExternal: "agentSessions.importExternal",
+  agentSessionsPreview: "agentSessions.preview",
   assetsCreateUrl: "assets.createUrl",
   assetsPersistChatAttachments: "assets.persistChatAttachments",
   attachmentsCreateUploadUrl: "attachments.createUploadUrl",
@@ -1521,9 +1524,19 @@ const WsAgentSessionsBanishedRpc = Rpc.make(WS_METHODS.agentSessionsBanished, {
   error: Schema.Union([AgentSessionScanError, EnvironmentAuthorizationError]),
 });
 
-const WsAgentSessionsImportRecentRpc = Rpc.make(WS_METHODS.agentSessionsImportRecent, {
-  payload: AgentSessionImportRecentInput,
-  success: AgentSessionImportRecentResult,
+const WsAgentSessionsPreviewRpc = Rpc.make(WS_METHODS.agentSessionsPreview, {
+  payload: AgentSessionPreviewInput,
+  success: AgentSessionPreviewResult,
+  error: Schema.Union([
+    AgentSessionHydrateError,
+    AgentSessionScanError,
+    EnvironmentAuthorizationError,
+  ]),
+});
+
+const WsAgentSessionsImportExternalRpc = Rpc.make(WS_METHODS.agentSessionsImportExternal, {
+  payload: AgentSessionImportExternalInput,
+  success: AgentSessionImportExternalResult,
   error: Schema.Union([AgentSessionScanError, EnvironmentAuthorizationError]),
 });
 
@@ -2313,7 +2326,8 @@ export const WsRpcGroup = RpcGroup.make(
   WsAgentSessionsBanishRpc,
   WsAgentSessionsRestoreRpc,
   WsAgentSessionsBanishedRpc,
-  WsAgentSessionsImportRecentRpc,
+  WsAgentSessionsImportExternalRpc,
+  WsAgentSessionsPreviewRpc,
   WsAssetsCreateUrlRpc,
   WsAssetsPersistChatAttachmentsRpc,
   WsAttachmentsCreateUploadUrlRpc,

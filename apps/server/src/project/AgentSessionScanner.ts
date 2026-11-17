@@ -84,7 +84,7 @@ const MAX_METADATA_RECORDS_PER_TRANSCRIPT = 1_000;
 const RECENT_THREAD_WINDOW_MS = 30 * 24 * 60 * 60 * 1000;
 // Screenshot-heavy transcripts can reach GiB; select fields while streaming to avoid allocating payloads.
 const MAX_IMPORTED_TRANSCRIPT_BYTES = 4 * 1024 * 1024 * 1024;
-const MAX_IMPORTED_MESSAGES = 200;
+export const MAX_IMPORTED_MESSAGES = 200;
 const MAX_IMPORT_HISTORY_BYTES = 32 * 1024 * 1024;
 const MAX_IMPORT_BYTES = 4 * 1024 * 1024 * 1024;
 /** The most transcripts one import call reads; a larger import is split into calls this size. */
@@ -250,6 +250,8 @@ export interface AgentSessionCatalogMetadata {
   readonly cwd: string | null;
   readonly title: string | null;
   readonly providerSessionId: string;
+  /** The whole transcript was read and holds no conversation, so there is nothing to open. */
+  readonly empty: boolean;
 }
 
 /** The enabled instances of a source whose homes hold its transcripts, the built-in one included. */
@@ -504,6 +506,20 @@ function isPiConversationRecord(
     record.type === "message" &&
     (record.message?.role === "user" || record.message?.role === "assistant")
   );
+}
+
+/** Whether a whole transcript holds no conversation: nothing to open, preview or import. */
+function transcriptIsEmpty(metadata: AgentSessionTranscriptMetadata, contents: string): boolean {
+  const lines = splitTranscriptRecords(contents, MAX_IMPORT_RECORDS + 1);
+  if (lines.length > MAX_IMPORT_RECORDS) return false;
+  const records = lines.flatMap((line) => Option.toArray(decodeTranscriptRecord(line)));
+  // A rewound Codex rollout inherits its conversation from the rollouts before it.
+  if (metadata.source === "codex" && codexHistoryBase(records) !== undefined) return false;
+  const claudeFields =
+    metadata.source === "claudeAgent"
+      ? records.reduce(foldClaudeFields, emptyClaudeFields)
+      : emptyClaudeFields;
+  return parseAgentSessionRecords(metadata, records, claudeFields, 0) === "empty";
 }
 
 export function parseAgentSessionTranscript(
@@ -2426,22 +2442,26 @@ export const make = Effect.gen(function* () {
             const decoder = new TextDecoder();
             let text = "";
             let bytesRead = 0;
+            let whole = false;
             while (bytesRead < CATALOG_PREFIX_BYTES) {
               const chunk = yield* readChunk(
                 Math.min(TRANSCRIPT_PREFIX_BYTES, CATALOG_PREFIX_BYTES - bytesRead),
               );
-              if (Option.isNone(chunk) || chunk.value.byteLength === 0) break;
+              if (Option.isNone(chunk) || chunk.value.byteLength === 0) {
+                whole = true;
+                break;
+              }
               bytesRead += chunk.value.byteLength;
               text += decoder.decode(chunk.value, { stream: true });
             }
-            return text;
+            return { text: text + decoder.decode(), whole };
           }),
         ),
       ),
     ).pipe(Effect.option);
     if (Option.isNone(prefix)) return Option.none<AgentSessionCatalogMetadata>();
     // The prefix can end mid-record, so only complete lines are parsed.
-    const contents = prefix.value.slice(0, prefix.value.lastIndexOf("\n") + 1);
+    const contents = prefix.value.text.slice(0, prefix.value.text.lastIndexOf("\n") + 1);
     let cwd: string | null = null;
     let nativeSessionId: string | null = null;
     for (const line of contents.split("\n")) {
@@ -2457,18 +2477,19 @@ export const make = Effect.gen(function* () {
       file.filePath,
       isCompressedTranscript(file.filePath) ? COMPRESSED_TRANSCRIPT_SUFFIX : ".jsonl",
     );
-    const thread = parseAgentSessionTranscript({
+    const transcriptMetadata = {
       source: file.source,
       providerInstanceId: file.providerInstanceId,
       fallbackSessionId,
       lastActiveAtMs: file.mtimeMs,
-      contents,
-    });
+    };
+    const thread = parseAgentSessionTranscript({ ...transcriptMetadata, contents });
     return Option.some<AgentSessionCatalogMetadata>({
       cwd,
       title: thread?.title ?? null,
       // A long first prompt can leave no whole message in the prefix; the metadata still names it.
       providerSessionId: nativeSessionId ?? thread?.providerSessionId ?? fallbackSessionId,
+      empty: prefix.value.whole && transcriptIsEmpty(transcriptMetadata, prefix.value.text),
     });
   });
 

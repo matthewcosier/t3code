@@ -81,6 +81,22 @@ test(
       await atRest(browser);
       await app.screenshot("external-lists-sessions");
 
+      // When a session is previewed, the start of its conversation shows under it.
+      await screen.getByRole("button", `Preview ${OLD_REQUEST}`).tap();
+      const preview = screen.getByTestId("external-session-preview-panel");
+      await expect(preview).toContainText(OLD_REPLY, { timeout: 30_000 });
+      await atRest(browser);
+      await app.screenshot("previewed");
+
+      // The page is scrolled part way down before a session is opened from it.
+      const scrolledTo = await browser.evaluate(() => {
+        const page = document.querySelector<HTMLElement>("[data-settings-page-scroll]");
+        if (page === null) return -1;
+        page.scrollTop = Math.floor((page.scrollHeight - page.clientHeight) / 2);
+        return page.scrollTop;
+      });
+      expect(scrolledTo).toBeGreaterThan(0);
+
       // When the year-old one is opened from the paged group, with another row's Open pressed
       // straight after it, only the first opens: it becomes an active thread holding its
       // conversation.
@@ -139,6 +155,11 @@ test(
       await expect(goneRow).toBeVisible();
       await expect(otherRow).toBeVisible();
       await expect(oldRow).toHaveCount(0, { timeout: 3_000 });
+      // and the page is back where it was scrolled to.
+      const scrolledBack = await browser.evaluate(
+        () => document.querySelector<HTMLElement>("[data-settings-page-scroll]")?.scrollTop ?? -1,
+      );
+      expect(Math.abs(scrolledBack - scrolledTo)).toBeLessThan(2);
       expect(
         await browser.evaluate(
           () =>

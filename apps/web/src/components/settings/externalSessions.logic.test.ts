@@ -25,13 +25,21 @@ import {
   externalFallbackToRemember,
   externalGroupFooter,
   externalGroupPageInputs,
+  externalFilter,
+  externalBanishedCursors,
+  externalGroupCheck,
   externalGroups,
   externalImportWindow,
+  externalIsSelected,
   externalLaggingPages,
   externalOpenFailureMessage,
   externalOpenGroups,
   externalRefreshDue,
   externalSelectionAfterClick,
+  externalSelectionAfterGroupClick,
+  externalSelectionChoice,
+  externalSelectionTakesAny,
+  externalSelectionWithout,
   externalSettledAnswer,
   externalListMoving,
   externalListRequests,
@@ -75,6 +83,7 @@ function page(
     listing: "a",
     olderThan: [],
     groupCounts: [],
+    importing: null,
     ...overrides,
   };
 }
@@ -672,6 +681,8 @@ describe("banishing", () => {
     const click = (key: string, modifiers: { range?: boolean } = {}) => ({
       key,
       orderedKeys,
+      groupOf: () => "week",
+      refOf: () => undefined,
       range: modifiers.range ?? false,
     });
     let selection = externalSelectionAfterClick(NO_EXTERNAL_SELECTION, click("b"));
@@ -687,6 +698,360 @@ describe("banishing", () => {
     expect([
       ...externalSelectionAfterClick(NO_EXTERNAL_SELECTION, click("d", { range: true })).keys,
     ]).toEqual(["d"]);
+  });
+
+  describe("whole groups", () => {
+    const groups = externalGroups(NOW);
+    const counts = (byGroup: Record<string, number>) =>
+      groups.map((group) => byGroup[group.id] ?? 0);
+    const week = groups.find((group) => group.id === "week")!;
+    const month = groups.find((group) => group.id === "month")!;
+    // Previous 7 days holds 40 sessions, of which the first page of 10 is on screen; Previous 30
+    // days holds 2, both on screen.
+    const weekRows = range(0, 10);
+    const monthRows = range(100, 2);
+    const view = externalListView({
+      groups,
+      requests: externalListRequests({ groups, listed: new Set(["week", "month"]), cursors: {} }),
+      results: [
+        page([], { totalCount: 42, groupCounts: counts({ week: 40, month: 2 }) }),
+        page(weekRows, { totalCount: 40 }),
+        page(monthRows, { totalCount: 2 }),
+      ],
+    })!;
+    const weekKeys = weekRows.map(externalEntryKey);
+    const monthKeys = monthRows.map(externalEntryKey);
+    const refs = new Map(
+      [...weekRows, ...monthRows].map((row) => [
+        externalEntryKey(row),
+        { providerInstanceId: row.providerInstanceId, filePath: row.filePath },
+      ]),
+    );
+    const refOf = (key: string) => refs.get(key);
+    const groupOf = (key: string) =>
+      weekKeys.includes(key)
+        ? "week"
+        : monthRows.map(externalEntryKey).includes(key)
+          ? "month"
+          : undefined;
+
+    it("ticks a whole group, rows not on screen included, and sends it as its span", () => {
+      const selection = externalSelectionAfterGroupClick(NO_EXTERNAL_SELECTION, "week", view);
+      expect(externalGroupCheck(selection, "week", view)).toBe("all");
+      expect(externalIsSelected(selection, weekKeys[3]!, "week")).toBe(true);
+      expect(externalSelectionChoice(selection, view)).toEqual({
+        sessions: [],
+        windows: [{ activeFrom: week.activeFrom, activeUntil: week.activeUntil }],
+        exclude: [],
+        count: 40,
+      });
+    });
+
+    it("leaves a row out of a whole group when it is unticked, and counts it out", () => {
+      let selection = externalSelectionAfterGroupClick(NO_EXTERNAL_SELECTION, "week", view);
+      selection = externalSelectionAfterClick(selection, {
+        key: weekKeys[2]!,
+        orderedKeys: weekKeys,
+        groupOf,
+        refOf,
+        range: false,
+      });
+      expect(externalGroupCheck(selection, "week", view)).toBe("some");
+      expect(externalIsSelected(selection, weekKeys[2]!, "week")).toBe(false);
+      const choice = externalSelectionChoice(selection, view);
+      expect(choice.count).toBe(39);
+      expect(choice.exclude).toEqual([
+        { providerInstanceId: weekRows[2]!.providerInstanceId, filePath: weekRows[2]!.filePath },
+      ]);
+      // Ticking it again puts it back in the group.
+      selection = externalSelectionAfterClick(selection, {
+        key: weekKeys[2]!,
+        orderedKeys: weekKeys,
+        groupOf,
+        refOf,
+        range: false,
+      });
+      expect(externalGroupCheck(selection, "week", view)).toBe("all");
+    });
+
+    it("turns a partly ticked group whole, and a whole one off", () => {
+      let selection = externalSelectionAfterClick(NO_EXTERNAL_SELECTION, {
+        key: weekKeys[0]!,
+        orderedKeys: weekKeys,
+        groupOf,
+        refOf,
+        range: false,
+      });
+      expect(externalGroupCheck(selection, "week", view)).toBe("some");
+      selection = externalSelectionAfterGroupClick(selection, "week", view);
+      expect(externalGroupCheck(selection, "week", view)).toBe("all");
+      expect(selection.keys.size).toBe(0);
+      selection = externalSelectionAfterGroupClick(selection, "week", view);
+      expect(externalGroupCheck(selection, "week", view)).toBe("none");
+      expect(externalSelectionChoice(selection, view).count).toBe(0);
+    });
+
+    it("shows a group ticked once every row of it is on screen and ticked one by one", () => {
+      const tick = (selection: typeof NO_EXTERNAL_SELECTION, key: string) =>
+        externalSelectionAfterClick(selection, {
+          key,
+          orderedKeys: [...weekKeys, ...monthKeys],
+          groupOf,
+          refOf,
+          range: false,
+        });
+      // Both of Previous 30 days' sessions are on screen: ticking both is the whole group,
+      let selection = tick(tick(NO_EXTERNAL_SELECTION, monthKeys[0]!), monthKeys[1]!);
+      expect(externalGroupCheck(selection, "month", view)).toBe("all");
+      // and its header then unticks both.
+      selection = externalSelectionAfterGroupClick(selection, "month", view);
+      expect(externalGroupCheck(selection, "month", view)).toBe("none");
+      expect(externalSelectionChoice(selection, view).count).toBe(0);
+      // Every row on screen ticked is still part of a group with rows not loaded yet.
+      selection = weekKeys.reduce(tick, NO_EXTERNAL_SELECTION);
+      expect(externalGroupCheck(selection, "week", view)).toBe("some");
+      expect(externalSelectionChoice(selection, view).count).toBe(10);
+    });
+
+    it("shows a whole group with every row unticked as unticked", () => {
+      let selection = externalSelectionAfterGroupClick(NO_EXTERNAL_SELECTION, "month", view);
+      for (const key of monthKeys) {
+        selection = externalSelectionAfterClick(selection, {
+          key,
+          orderedKeys: monthKeys,
+          groupOf,
+          refOf,
+          range: false,
+        });
+      }
+      expect(externalGroupCheck(selection, "month", view)).toBe("none");
+      expect(externalSelectionChoice(selection, view).count).toBe(0);
+      // Its header then takes the whole group again.
+      selection = externalSelectionAfterGroupClick(selection, "month", view);
+      expect(externalGroupCheck(selection, "month", view)).toBe("all");
+      expect(externalSelectionChoice(selection, view).count).toBe(2);
+    });
+
+    it("sends ticked rows of other groups beside a whole group", () => {
+      let selection = externalSelectionAfterGroupClick(NO_EXTERNAL_SELECTION, "week", view);
+      const monthKey = externalEntryKey(monthRows[1]!);
+      selection = externalSelectionAfterClick(selection, {
+        key: monthKey,
+        orderedKeys: [...weekKeys, ...monthRows.map(externalEntryKey)],
+        groupOf,
+        refOf,
+        range: false,
+      });
+      const choice = externalSelectionChoice(selection, view);
+      expect(choice.count).toBe(41);
+      expect(choice.sessions).toEqual([
+        { providerInstanceId: monthRows[1]!.providerInstanceId, filePath: monthRows[1]!.filePath },
+      ]);
+      expect(choice.windows).toEqual([
+        { activeFrom: week.activeFrom, activeUntil: week.activeUntil },
+      ]);
+      expect(month.id).toBe("month");
+    });
+
+    it("keeps a closed group's left-out and ticked rows in the choice", () => {
+      const orderedKeys = [...weekKeys, ...monthKeys];
+      // Previous 7 days taken whole less one row, and one row of Previous 30 days ticked,
+      let selection = externalSelectionAfterGroupClick(NO_EXTERNAL_SELECTION, "week", view);
+      for (const key of [weekKeys[2]!, monthKeys[1]!]) {
+        selection = externalSelectionAfterClick(selection, {
+          key,
+          orderedKeys,
+          groupOf,
+          refOf,
+          range: false,
+        });
+      }
+      const choice = externalSelectionChoice(selection, view);
+      expect(choice).toEqual({
+        sessions: [refOf(monthKeys[1]!)],
+        windows: [{ activeFrom: week.activeFrom, activeUntil: week.activeUntil }],
+        exclude: [refOf(weekKeys[2]!)],
+        count: 40,
+      });
+      // then both groups closed, so none of their rows is on screen: the choice is the same.
+      const closed = externalListView({
+        groups,
+        requests: externalListRequests({ groups, listed: new Set(), cursors: {} }),
+        results: [page([], { totalCount: 42, groupCounts: counts({ week: 40, month: 2 }) })],
+      })!;
+      expect(closed.groups.every((groupView) => groupView.entries === null)).toBe(true);
+      expect(externalSelectionChoice(selection, closed)).toEqual(choice);
+      expect(externalGroupCheck(selection, "week", closed)).toBe("some");
+      expect(externalGroupCheck(selection, "month", closed)).toBe("some");
+      // Its header takes the closed group whole again, the row left out included.
+      const whole = externalSelectionAfterGroupClick(selection, "week", closed);
+      expect(externalSelectionChoice(whole, closed).exclude).toEqual([]);
+      expect(externalSelectionChoice(whole, closed).count).toBe(41);
+    });
+
+    it("sends every unticked session as itself, however little of it the screen shows", () => {
+      const left = weekKeys[9]!;
+      // Previous 7 days taken whole, its tenth row unticked,
+      let selection = externalSelectionAfterGroupClick(NO_EXTERNAL_SELECTION, "week", view);
+      selection = externalSelectionAfterClick(selection, {
+        key: left,
+        orderedKeys: weekKeys,
+        groupOf,
+        refOf,
+        range: false,
+      });
+      // then the group reopened on fewer rows than were shown when it was unticked.
+      const fewer = externalListView({
+        groups,
+        requests: externalListRequests({ groups, listed: new Set(["week", "month"]), cursors: {} }),
+        results: [
+          page([], { totalCount: 42, groupCounts: counts({ week: 40, month: 2 }) }),
+          page(weekRows.slice(0, 5), { totalCount: 40 }),
+          page(monthRows, { totalCount: 2 }),
+        ],
+      })!;
+      expect(externalSelectionChoice(selection, fewer)).toEqual({
+        sessions: [],
+        windows: [{ activeFrom: week.activeFrom, activeUntil: week.activeUntil }],
+        exclude: [refOf(left)],
+        count: 39,
+      });
+      expect(externalGroupCheck(selection, "week", fewer)).toBe("some");
+    });
+
+    it("still leaves out an unticked session that moved to another group", () => {
+      const moved = weekKeys[2]!;
+      // Today and Previous 7 days taken whole, one session of Previous 7 days unticked; it is then
+      // used again outside T3 Code and moves to Today, which is closed.
+      const selection = {
+        ...NO_EXTERNAL_SELECTION,
+        groups: new Set(["today", "week"]),
+        excluded: new Set([moved]),
+        rows: new Map([[moved, { ref: refOf(moved)!, groupId: "week" }]]),
+      };
+      const after = externalListView({
+        groups,
+        requests: externalListRequests({ groups, listed: new Set(["week"]), cursors: {} }),
+        results: [
+          page([], { totalCount: 41, groupCounts: counts({ today: 1, week: 40 }) }),
+          page(
+            weekRows.filter((row) => externalEntryKey(row) !== moved),
+            { totalCount: 40 },
+          ),
+        ],
+      })!;
+      expect(externalSelectionChoice(selection, after).exclude).toEqual([refOf(moved)]);
+      expect(externalSelectionTakesAny(selection)).toBe(true);
+    });
+
+    it("takes a row ticked again out of the unticked, wherever it was unticked", () => {
+      const row = weekKeys[2]!;
+      // Unticked while Previous 7 days was whole, which has since been unticked,
+      const selection = {
+        ...NO_EXTERNAL_SELECTION,
+        excluded: new Set([row]),
+        rows: new Map([[row, { ref: refOf(row)!, groupId: "week" }]]),
+      };
+      const ticked = externalSelectionAfterClick(selection, {
+        key: row,
+        orderedKeys: weekKeys,
+        groupOf,
+        refOf,
+        range: false,
+      });
+      expect(externalSelectionChoice(ticked, view)).toEqual({
+        sessions: [refOf(row)],
+        windows: [],
+        exclude: [],
+        count: 1,
+      });
+    });
+
+    it("keeps the other ticks when one row leaves the list", () => {
+      let selection = NO_EXTERNAL_SELECTION;
+      for (const key of weekKeys.slice(0, 3)) {
+        selection = externalSelectionAfterClick(selection, {
+          key,
+          orderedKeys: weekKeys,
+          groupOf: () => undefined,
+          refOf,
+          range: false,
+        });
+      }
+      const after = externalSelectionWithout(selection, new Set([weekKeys[1]!]));
+      expect([...after.keys].toSorted()).toEqual([weekKeys[0]!, weekKeys[2]!].toSorted());
+    });
+  });
+});
+
+describe("externalBanishedCursors", () => {
+  const rows = (from: number, count: number) =>
+    Array.from({ length: count }, (_, offset) => entry(from + offset));
+  const after = (index: number) => externalCursorAfter(entry(index));
+
+  it("keeps pages whose boundaries still hold, and reads the next one when more are shown", () => {
+    const answers = [
+      { entries: rows(0, 200), totalCount: 300 },
+      { entries: rows(200, 100), totalCount: 300 },
+    ];
+    expect(externalBanishedCursors({ answers, cursors: [after(199)], shown: 250 })).toEqual([
+      after(199),
+    ]);
+    expect(
+      externalBanishedCursors({ answers: answers.slice(0, 1), cursors: [], shown: 250 }),
+    ).toEqual([after(199)]);
+    expect(
+      externalBanishedCursors({ answers: answers.slice(0, 1), cursors: [], shown: 50 }),
+    ).toEqual([]);
+  });
+
+  it("reads the next page from the new boundary when a session is banished or restored", () => {
+    // A newer session banished: the first page now ends a row earlier, so the row it pushed out
+    // is read with the next page rather than lost between them.
+    const banished = [
+      { entries: [entry(-1), ...rows(0, 199)], totalCount: 301 },
+      { entries: rows(200, 100), totalCount: 301 },
+    ];
+    expect(
+      externalBanishedCursors({ answers: banished, cursors: [after(199)], shown: 250 }),
+    ).toEqual([after(198)]);
+    // One restored: the first page now ends a row later, so the next page does not repeat it.
+    const restored = [
+      { entries: rows(1, 200), totalCount: 299 },
+      { entries: rows(200, 99), totalCount: 299 },
+    ];
+    expect(
+      externalBanishedCursors({ answers: restored, cursors: [after(199)], shown: 250 }),
+    ).toEqual([after(200)]);
+    // Every page past the first moved boundary is read again from it.
+    const three = [
+      { entries: [entry(-1), ...rows(0, 199)], totalCount: 501 },
+      { entries: rows(200, 200), totalCount: 501 },
+      { entries: rows(400, 100), totalCount: 501 },
+    ];
+    expect(
+      externalBanishedCursors({ answers: three, cursors: [after(199), after(399)], shown: 450 }),
+    ).toEqual([after(198)]);
+  });
+});
+
+describe("externalFilter", () => {
+  it("asks with no filter for an empty search and no tools, so it reads the unfiltered pages", () => {
+    expect(externalFilter("   ", [])).toBeUndefined();
+    expect(externalFilter(" billing ", [])).toEqual({ search: "billing" });
+    expect(externalFilter("", ["pi", "codex"])).toEqual({ sources: ["codex", "pi"] });
+  });
+
+  it("carries the filter into every request the list makes", () => {
+    const groups = externalGroups(NOW);
+    const filter = { search: "billing" };
+    const requests = externalListRequests({
+      groups,
+      listed: new Set(["week", "older"]),
+      cursors: { older: [externalCursorAfter(entry(9))] },
+      filter,
+    });
+    expect(requests.inputs.every((input) => input.filter === filter)).toBe(true);
   });
 });
 

@@ -3,6 +3,8 @@ import * as NodeSqlite from "node:sqlite";
 import {
   AGENT_SESSION_BANISH_MONTHS,
   AGENT_SESSION_CATALOG_MAX_PAGE_SIZE,
+  AGENT_SESSION_PREVIEW_CHARACTERS,
+  AGENT_SESSION_PREVIEW_MESSAGES,
   AgentSessionHydrateError,
   AgentSessionImportProjectChangedError,
   AgentSessionImportProjectNotFoundError,
@@ -11,6 +13,7 @@ import {
   CommandId,
   ProjectId,
   ProviderInstanceId,
+  ThreadId,
   type AgentSessionBanishedEntry,
   type AgentSessionBanishedInput,
   type AgentSessionBanishedResult,
@@ -22,8 +25,12 @@ import {
   type AgentSessionCatalogResult,
   type AgentSessionHydrateInput,
   type AgentSessionHydrateResult,
-  type AgentSessionImportRecentInput,
-  type AgentSessionImportRecentResult,
+  type AgentSessionFilter,
+  type AgentSessionImportExternalInput,
+  type AgentSessionImportExternalResult,
+  type AgentSessionPreviewInput,
+  type AgentSessionPreviewResult,
+  type AgentSessionWindow,
   type AgentSessionRef,
   type AgentSessionRestoreInput,
   type AgentSessionRestoreResult,
@@ -41,6 +48,7 @@ import * as Option from "effect/Option";
 import * as Path from "effect/Path";
 import * as Schema from "effect/Schema";
 import * as Semaphore from "effect/Semaphore";
+import * as Stream from "effect/Stream";
 import * as SqlClient from "effect/sql/SqlClient";
 
 import * as ServerConfig from "../config.ts";
@@ -51,7 +59,7 @@ import * as AgentSessionScanner from "./AgentSessionScanner.ts";
 import * as ProjectService from "./ProjectService.ts";
 
 /** The catalog is derived from transcripts on disk, so a newer layout simply rebuilds it. */
-const CATALOG_SCHEMA_VERSION = 2;
+const CATALOG_SCHEMA_VERSION = 3;
 const CATALOG_FILE_NAME = "agent-session-catalog.sqlite";
 /**
  * A refresh request within this long of the last finished pass is skipped. Short enough that a
@@ -61,6 +69,8 @@ const REFRESH_INTERVAL_MS = 15_000;
 const DEFAULT_PAGE_SIZE = 50;
 const INDEX_BATCH_SIZE = 200;
 const INDEX_READ_CONCURRENCY = 8;
+/** Sessions per importer call during a bulk import: small, so progress and the list move often. */
+const IMPORT_BATCH_SIZE = 20;
 
 interface CatalogRow {
   readonly provider_instance_id: string;
@@ -74,6 +84,8 @@ interface CatalogRow {
   readonly project_root: string | null;
   readonly title: string | null;
   readonly provider_session_id: string | null;
+  /** 1 when the whole transcript holds no conversation. */
+  readonly empty: number;
 }
 
 const isAgentSessionSource = Schema.is(AgentSessionSource);
@@ -119,6 +131,7 @@ const SCHEMA_SQL = `
     project_root TEXT,
     title TEXT,
     provider_session_id TEXT,
+    empty INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (provider_instance_id, file_path)
   );
   CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
@@ -187,12 +200,17 @@ export class AgentSessionCatalog extends Context.Service<
       | AgentSessionScanError
     >;
     /**
-     * Imports every listed session last active since `activeFrom` as a settled thread, creating
-     * projects for folders that have none. Sessions that cannot be opened are skipped.
+     * Imports listed sessions as settled threads, every one last active since a time or the chosen
+     * ones, creating projects for folders that have none. Sessions that cannot be opened are
+     * skipped.
      */
-    readonly importRecent: (
-      input: AgentSessionImportRecentInput,
-    ) => Effect.Effect<AgentSessionImportRecentResult, AgentSessionScanError>;
+    readonly importSessions: (
+      input: AgentSessionImportExternalInput,
+    ) => Effect.Effect<AgentSessionImportExternalResult, AgentSessionScanError>;
+    /** The start of a session's conversation, read without importing it. */
+    readonly preview: (
+      input: AgentSessionPreviewInput,
+    ) => Effect.Effect<AgentSessionPreviewResult, AgentSessionHydrateError | AgentSessionScanError>;
     /** Indexes new and changed transcripts now and waits for it; refresh requests do this in the background. */
     readonly index: Effect.Effect<void, AgentSessionScanError>;
     /** Sends sessions to the archive; they leave the External shelf until restored or active again. */
@@ -274,6 +292,8 @@ const make = Effect.gen(function* () {
     readonly indexedAt: string | null;
     readonly revision: number;
   } | null = null;
+  /** How far the running import has got; read into every list answer. */
+  let importProgress: { done: number; total: number } | null = null;
   /** Call right after a committed write that changes what the catalog lists. */
   const listedChanged = () => {
     revision += 1;
@@ -341,6 +361,7 @@ const make = Effect.gen(function* () {
               projectRoot,
               title: metadata?.title ?? null,
               providerSessionId: metadata?.providerSessionId ?? null,
+              empty: metadata?.empty === true,
             };
           }),
         { concurrency: INDEX_READ_CONCURRENCY },
@@ -350,8 +371,8 @@ const make = Effect.gen(function* () {
         const upsert = db.prepare(`
           INSERT INTO transcripts (
             provider_instance_id, file_path, source, home_path, mtime_ms, size,
-            project_roots, cwd, project_root, title, provider_session_id
-          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            project_roots, cwd, project_root, title, provider_session_id, empty
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
           ON CONFLICT (provider_instance_id, file_path) DO UPDATE SET
             source = excluded.source,
             home_path = excluded.home_path,
@@ -361,7 +382,8 @@ const make = Effect.gen(function* () {
             cwd = excluded.cwd,
             project_root = excluded.project_root,
             title = excluded.title,
-            provider_session_id = excluded.provider_session_id
+            provider_session_id = excluded.provider_session_id,
+            empty = excluded.empty
         `);
         db.exec("BEGIN");
         try {
@@ -378,6 +400,7 @@ const make = Effect.gen(function* () {
               row.projectRoot,
               row.title,
               row.providerSessionId,
+              row.empty ? 1 : 0,
             );
           }
           db.exec("COMMIT");
@@ -561,10 +584,11 @@ const make = Effect.gen(function* () {
     snapshot !== null
       ? Effect.succeed({ ...snapshot, indexing })
       : withDatabase((db) => {
-          // A row with no project folder is a subagent, has no cwd, or ran in a folder that is gone.
+          // A row with no project folder is a subagent, has no cwd, or ran in a folder that is gone;
+          // an empty one holds no conversation to open.
           const rows = (
             db
-              .prepare("SELECT * FROM transcripts WHERE project_root IS NOT NULL")
+              .prepare("SELECT * FROM transcripts WHERE project_root IS NOT NULL AND empty = 0")
               .all() as unknown as Array<CatalogRow>
           ).sort(compareRows);
           const banished = new Map(
@@ -610,9 +634,51 @@ const make = Effect.gen(function* () {
       .join(":");
   };
 
+  /** Whether a session matches the filter: one of its tools, and the text in its title or folder. */
+  const matchesFilter = (row: CatalogRow, filter: AgentSessionFilter | undefined) => {
+    if (filter === undefined) return true;
+    if (filter.sources !== undefined && filter.sources.length > 0) {
+      if (!filter.sources.some((source) => source === row.source)) return false;
+    }
+    const search = filter.search?.trim().toLocaleLowerCase() ?? "";
+    if (search === "") return true;
+    return [row.title, row.cwd, row.project_root].some(
+      (text) => text !== null && text.toLocaleLowerCase().includes(search),
+    );
+  };
+
+  /** The rows a choice picks: the chosen ones and every one in its windows, less the excluded. */
+  const chosenRows = (
+    rows: ReadonlyArray<CatalogRow>,
+    choice: {
+      readonly sessions: ReadonlyArray<AgentSessionRef>;
+      readonly windows?: ReadonlyArray<AgentSessionWindow> | undefined;
+      readonly exclude?: ReadonlyArray<AgentSessionRef> | undefined;
+    },
+  ) => {
+    const keyOf = (ref: AgentSessionRef) => rowKey(ref.providerInstanceId, ref.filePath);
+    const chosen = new Set(choice.sessions.map(keyOf));
+    const excluded = new Set((choice.exclude ?? []).map(keyOf));
+    const windows = (choice.windows ?? []).map((window) => ({
+      fromMs: window.activeFrom === undefined ? null : epochMillis(window.activeFrom),
+      untilMs: window.activeUntil === undefined ? null : epochMillis(window.activeUntil),
+    }));
+    return rows.filter((row) => {
+      const key = rowKey(row.provider_instance_id, row.file_path);
+      if (excluded.has(key)) return false;
+      if (chosen.has(key)) return true;
+      return windows.some(
+        (window) =>
+          (window.fromMs === null || row.mtime_ms >= window.fromMs) &&
+          (window.untilMs === null || row.mtime_ms < window.untilMs),
+      );
+    });
+  };
+
   const placedSessions = Effect.fn("AgentSessionCatalog.placedSessions")(function* (
     settings: ServerSettingsValue,
     projectIds: ReadonlyArray<ProjectId> | undefined,
+    filter?: AgentSessionFilter,
   ) {
     const held = yield* heldSessions;
     const projectByRoot = yield* projectsByRealRoot;
@@ -634,6 +700,8 @@ const make = Effect.gen(function* () {
         listedSessions.add(session);
       }
       if (isHeld(held, row)) continue;
+      // After the newest rollout of each session is taken, so a filter never brings up an older one.
+      if (!matchesFilter(row, filter)) continue;
       const projectId =
         projectByRoot.get(normalizeProjectPathForComparison(row.project_root ?? "")) ?? null;
       if (wanted !== null && (projectId === null || !wanted.has(projectId))) continue;
@@ -674,10 +742,11 @@ const make = Effect.gen(function* () {
           groupCounts: [],
           revision: 0,
           listing: "",
+          importing: null,
         };
       }
       if (input.refresh === true) yield* requestRefresh;
-      const placed = yield* placedSessions(settings, input.projectIds);
+      const placed = yield* placedSessions(settings, input.projectIds, input.filter);
       const after = input.before === undefined ? null : cursorRow(input.before);
       const through = input.through === undefined ? null : cursorRow(input.through);
       const limit = Math.min(input.limit ?? DEFAULT_PAGE_SIZE, AGENT_SESSION_CATALOG_MAX_PAGE_SIZE);
@@ -718,6 +787,7 @@ const make = Effect.gen(function* () {
         groupCounts,
         revision: placed.revision,
         listing: placed.listing,
+        importing: importProgress === null ? null : { ...importProgress },
       };
     },
   );
@@ -727,7 +797,7 @@ const make = Effect.gen(function* () {
   )(function* (input) {
     const settings = yield* readSettings;
     if (!settings.externalSessions) return { entries: [], totalCount: 0 };
-    const placed = yield* placedSessions(settings, input.projectIds);
+    const placed = yield* placedSessions(settings, input.projectIds, input.filter);
     const after = input.before === undefined ? null : cursorRow(input.before);
     const limit = Math.min(input.limit ?? DEFAULT_PAGE_SIZE, AGENT_SESSION_CATALOG_MAX_PAGE_SIZE);
     const entries: Array<AgentSessionBanishedEntry> = [];
@@ -749,20 +819,18 @@ const make = Effect.gen(function* () {
       const placed = yield* placedSessions(
         settings,
         input.kind === "olderThan" ? input.projectIds : undefined,
+        input.filter,
       );
-      // Only sessions the shelf lists can be banished: what the person saw, not what a stale page held.
-      const listed = placed.sessions.filter((session) => session.banished === null);
+      // Only sessions the list shows can be banished: what the person saw, not what a stale page held.
+      const listed = placed.sessions.flatMap(({ row, banished }) =>
+        banished === null ? [row] : [],
+      );
       let targets: ReadonlyArray<CatalogRow>;
       if (input.kind === "olderThan") {
         const cutoffMs = yield* monthsAgo(input.months);
-        targets = listed.flatMap(({ row }) => (row.mtime_ms < cutoffMs ? [row] : []));
+        targets = listed.filter((row) => row.mtime_ms < cutoffMs);
       } else {
-        const chosen = new Set(
-          input.sessions.map((session) => rowKey(session.providerInstanceId, session.filePath)),
-        );
-        targets = listed.flatMap(({ row }) =>
-          chosen.has(rowKey(row.provider_instance_id, row.file_path)) ? [row] : [],
-        );
+        targets = chosenRows(listed, input);
       }
       const banishedAt = DateTime.formatIso(yield* DateTime.now);
       yield* withDatabase((db) => {
@@ -795,6 +863,23 @@ const make = Effect.gen(function* () {
   )(function* (input) {
     const settings = yield* readSettings;
     if (!settings.externalSessions) return { count: 0 };
+    // Restoring every banished session takes the ones listed as banished, under the filter.
+    const sessions: ReadonlyArray<AgentSessionRef> =
+      input.kind === "banished"
+        ? (yield* placedSessions(settings, undefined, input.filter)).sessions.flatMap(
+            ({ row, banished }) =>
+              banished === null
+                ? []
+                : [
+                    {
+                      providerInstanceId: ProviderInstanceId.make(row.provider_instance_id),
+                      filePath: row.file_path,
+                    },
+                  ],
+          )
+        : input.kind === "sessions"
+          ? input.sessions
+          : [];
     const count = yield* withDatabase((db) => {
       let changes = 0;
       db.exec("BEGIN");
@@ -807,7 +892,7 @@ const make = Effect.gen(function* () {
           const remove = db.prepare(
             "DELETE FROM banished WHERE provider_instance_id = ? AND file_path = ?",
           );
-          for (const session of input.sessions satisfies ReadonlyArray<AgentSessionRef>) {
+          for (const session of sessions) {
             changes += Number(remove.run(session.providerInstanceId, session.filePath).changes);
           }
         }
@@ -820,6 +905,24 @@ const make = Effect.gen(function* () {
       return changes;
     });
     return { count };
+  });
+
+  /** The transcript an import or a preview reads, as the file is on disk now. */
+  const transcriptFile = (
+    row: CatalogRow,
+    source: AgentSessionSource,
+    stats: FileSystem.File.Info,
+  ): AgentSessionScanner.AgentSessionTranscriptFile => ({
+    source,
+    providerInstanceId: ProviderInstanceId.make(row.provider_instance_id),
+    homePath: row.home_path,
+    filePath: row.file_path,
+    mtimeMs: Option.match(stats.mtime, {
+      onNone: () => row.mtime_ms,
+      onSome: (mtime) => mtime.getTime(),
+    }),
+    size: Number(stats.size),
+    projectRoots: Option.getOrUndefined(decodeProjectRoots(row.project_roots ?? "null")),
   });
 
   /**
@@ -876,20 +979,7 @@ const make = Effect.gen(function* () {
           Effect.mapError(() => fail("no-project")),
         ));
 
-    const projectRoots = decodeProjectRoots(row.project_roots ?? "null");
-    const transcript: AgentSessionScanner.AgentSessionTranscriptFile = {
-      source: row.source,
-      providerInstanceId: ProviderInstanceId.make(row.provider_instance_id),
-      homePath: row.home_path,
-      filePath: row.file_path,
-      mtimeMs: Option.match(stats.value.mtime, {
-        onNone: () => row.mtime_ms,
-        onSome: (mtime) => mtime.getTime(),
-      }),
-      size: Number(stats.value.size),
-      projectRoots: Option.getOrUndefined(projectRoots),
-    };
-    return { projectId, transcript };
+    return { projectId, transcript: transcriptFile(row, row.source, stats.value) };
   });
 
   const hydrateSession = Effect.fn("AgentSessionCatalog.hydrateSession")(function* (
@@ -923,99 +1013,159 @@ const make = Effect.gen(function* () {
   const hydrate: AgentSessionCatalog["Service"]["hydrate"] = (input) =>
     hydrateLock.withPermits(1)(hydrateSession(input));
 
-  const importRecent: AgentSessionCatalog["Service"]["importRecent"] = (input) =>
-    importLock.withPermits(1)(
-      Effect.gen(function* () {
-        const settings = yield* readSettings;
-        if (!settings.externalSessions) return { importedCount: 0, skippedCount: 0 };
-        const fromMs = epochMillis(input.activeFrom);
-        // What the list shows now: not held, not banished, last active since `activeFrom`.
-        const placed = yield* placedSessions(settings, input.projectIds);
-        const rows = placed.sessions.flatMap(({ row, banished }) =>
-          banished === null && row.mtime_ms >= fromMs ? [row] : [],
+  /** Whether a thread holds the session in this transcript, imported or started from it. */
+  const holdsTranscript = (
+    held: { readonly nativeIds: ReadonlySet<string>; readonly filePaths: ReadonlySet<string> },
+    transcript: AgentSessionScanner.AgentSessionTranscriptFile,
+  ) => held.filePaths.has(transcript.filePath) || held.nativeIds.has(transcript.filePath);
+
+  const importRun = Effect.fn("AgentSessionCatalog.importRun")(function* (
+    input: AgentSessionImportExternalInput,
+  ) {
+    const settings = yield* readSettings;
+    if (!settings.externalSessions) return { importedCount: 0, skippedCount: 0, threadIds: [] };
+    // Only what the list shows now, under the filter: not held, not banished.
+    const placed = yield* placedSessions(settings, undefined, input.filter);
+    const listed = placed.sessions.flatMap(({ row, banished }) => (banished === null ? [row] : []));
+    const rows = chosenRows(listed, input);
+    const progress = { done: 0, total: rows.length };
+    importProgress = progress;
+    let skippedCount = 0;
+    const byProject = new Map<ProjectId, Array<AgentSessionScanner.AgentSessionTranscriptFile>>();
+    for (const row of rows) {
+      const prepared = yield* prepareSession(settings, row).pipe(
+        Effect.asSome,
+        // Gone from disk, no folder to open, unreadable or its provider off: skipped.
+        Effect.catchTags({ AgentSessionHydrateError: () => Effect.succeedNone }),
+      );
+      if (Option.isNone(prepared)) {
+        skippedCount += 1;
+        progress.done += 1;
+        continue;
+      }
+      const { projectId, transcript } = prepared.value;
+      const chosen = byProject.get(projectId);
+      if (chosen === undefined) byProject.set(projectId, [transcript]);
+      else chosen.push(transcript);
+    }
+    // Shares the open lock, so an open of the same session finds the thread made here.
+    const importBatch = (
+      projectId: ProjectId,
+      batch: ReadonlyArray<AgentSessionScanner.AgentSessionTranscriptFile>,
+    ) =>
+      hydrateLock
+        .withPermits(1)(importer.importRecentAgentThreads({ projectId }, { chosen: batch }))
+        .pipe(
+          Effect.asSome,
+          // The project was removed or moved since it was found; its sessions stay listed.
+          Effect.catchTags({
+            AgentSessionImportProjectNotFoundError: () => Effect.succeedNone,
+            AgentSessionImportProjectChangedError: () => Effect.succeedNone,
+          }),
         );
-        let skippedCount = 0;
-        const byProject = new Map<
-          ProjectId,
-          Array<AgentSessionScanner.AgentSessionTranscriptFile>
-        >();
-        for (const row of rows) {
-          const prepared = yield* prepareSession(settings, row).pipe(
-            Effect.asSome,
-            // Gone from disk, no folder to open, unreadable or its provider off: skipped.
-            Effect.catchTags({ AgentSessionHydrateError: () => Effect.succeedNone }),
-          );
-          if (Option.isNone(prepared)) {
-            skippedCount += 1;
-            continue;
-          }
-          const { projectId, transcript } = prepared.value;
-          const chosen = byProject.get(projectId);
-          if (chosen === undefined) byProject.set(projectId, [transcript]);
-          else chosen.push(transcript);
-        }
-        // Shares the open lock, so an open of the same session finds the thread made here.
-        const importBatch = (
-          projectId: ProjectId,
-          batch: ReadonlyArray<AgentSessionScanner.AgentSessionTranscriptFile>,
-        ) =>
-          hydrateLock
-            .withPermits(1)(importer.importRecentAgentThreads({ projectId }, { chosen: batch }))
-            .pipe(
-              Effect.asSome,
-              // The project was removed or moved since it was found; its sessions stay listed.
-              Effect.catchTags({
-                AgentSessionImportProjectNotFoundError: () => Effect.succeedNone,
-                AgentSessionImportProjectChangedError: () => Effect.succeedNone,
-              }),
-            );
-        let importedCount = 0;
-        for (const [projectId, chosen] of byProject) {
-          // One importer call takes at most its transcript limit, and all of them share one byte
-          // budget; the sessions a batch skips go through again one at a time, so a skip means
-          // that session could not be imported, not that the batch ran out.
-          for (
-            let start = 0;
-            start < chosen.length;
-            start += AgentSessionScanner.MAX_IMPORT_TRANSCRIPTS
-          ) {
-            const batch = chosen.slice(start, start + AgentSessionScanner.MAX_IMPORT_TRANSCRIPTS);
-            const result = yield* importBatch(projectId, batch);
-            if (Option.isNone(result)) {
-              skippedCount += batch.length;
-              continue;
-            }
-            importedCount += result.value.importedCount;
-            if (result.value.skippedCount === 0 || batch.length === 1) {
-              skippedCount += result.value.skippedCount;
-              continue;
-            }
+    let importedCount = 0;
+    const threadIds = new Set<ThreadId>();
+    const prepared: Array<AgentSessionScanner.AgentSessionTranscriptFile> = [];
+    for (const [projectId, chosen] of byProject) {
+      prepared.push(...chosen);
+      // Small batches, so the list empties and the progress moves as the import goes. One call
+      // shares a byte budget across its batch, so the sessions a batch skips go through again one
+      // at a time: a skip then means that session could not be imported.
+      for (let start = 0; start < chosen.length; start += IMPORT_BATCH_SIZE) {
+        const batch = chosen.slice(start, start + IMPORT_BATCH_SIZE);
+        const result = yield* importBatch(projectId, batch);
+        if (Option.isSome(result)) {
+          importedCount += result.value.importedCount;
+          for (const threadId of result.value.threadIds ?? []) threadIds.add(threadId);
+          if (result.value.skippedCount > 0 && batch.length > 1) {
             // Only the sessions no thread holds yet go through again: one the batch imported may
             // have moved on since, and would read as a skip.
             const held = yield* heldSessions;
-            const left = batch.filter(
-              (transcript) =>
-                !held.filePaths.has(transcript.filePath) &&
-                !held.nativeIds.has(transcript.filePath),
-            );
-            for (const transcript of left) {
+            for (const transcript of batch.filter((each) => !holdsTranscript(held, each))) {
               const single = yield* importBatch(projectId, [transcript]);
-              if (Option.isNone(single)) {
-                skippedCount += 1;
-                continue;
-              }
+              if (Option.isNone(single)) continue;
               importedCount += single.value.importedCount;
-              skippedCount += single.value.skippedCount;
+              for (const threadId of single.value.threadIds ?? []) threadIds.add(threadId);
             }
           }
-          // Each project's sessions leave the list as soon as they are threads.
-          yield* Effect.sync(listedChanged);
         }
-        return { importedCount, skippedCount };
-      }),
+        progress.done += batch.length;
+        // The sessions just imported leave the list now.
+        yield* Effect.sync(listedChanged);
+      }
+    }
+    // What no thread holds at the end was not imported: refused, unreadable or with nothing in it.
+    const held = yield* heldSessions;
+    skippedCount += prepared.filter((transcript) => !holdsTranscript(held, transcript)).length;
+    return { importedCount, skippedCount, threadIds: [...threadIds] };
+  });
+
+  // One import at a time; its progress shows in every list answer until it ends.
+  const importSessions: AgentSessionCatalog["Service"]["importSessions"] = (input) =>
+    importLock.withPermits(1)(
+      importRun(input).pipe(
+        Effect.ensuring(
+          Effect.sync(() => {
+            importProgress = null;
+          }),
+        ),
+      ),
     );
 
-  return AgentSessionCatalog.of({ list, hydrate, importRecent, index, banish, restore, banished });
+  const preview: AgentSessionCatalog["Service"]["preview"] = Effect.fn(
+    "AgentSessionCatalog.preview",
+  )(function* (input) {
+    const fail = (reason: AgentSessionHydrateError["reason"]) =>
+      new AgentSessionHydrateError({ reason, filePath: input.filePath });
+    const settings = yield* readSettings;
+    if (!settings.externalSessions) return yield* fail("disabled");
+    const row = yield* withDatabase(
+      (db) =>
+        db
+          .prepare("SELECT * FROM transcripts WHERE provider_instance_id = ? AND file_path = ?")
+          .get(input.providerInstanceId, input.filePath) as CatalogRow | undefined,
+    );
+    if (row === undefined || !isAgentSessionSource(row.source)) return yield* fail("not-found");
+    const stats = yield* fileSystem.stat(row.file_path).pipe(Effect.option);
+    if (Option.isNone(stats) || stats.value.type !== "File") return yield* fail("not-found");
+    if (row.cwd === null) return yield* fail("not-importable");
+    // Reads the conversation the way an import would, without making a project or a thread.
+    const projectRoot = yield* scanner.resolveProjectRoot(row.cwd);
+    if (Option.isNone(projectRoot)) return yield* fail("no-project");
+    const outcomes = yield* Stream.runCollect(
+      scanner.recentThreads(projectRoot.value, [], [transcriptFile(row, row.source, stats.value)]),
+    );
+    const thread = [...outcomes].flatMap((outcome) =>
+      outcome._tag === "Importable" ? [outcome.thread] : [],
+    )[0];
+    if (thread === undefined) return yield* fail("not-importable");
+    // A long conversation is held as its opening request and its latest messages, with the middle
+    // left out: its start stops at the opening request.
+    const held =
+      thread.omittedMessageCount > 0 &&
+      thread.messages.length >= AgentSessionScanner.MAX_IMPORTED_MESSAGES
+        ? thread.messages.slice(0, 1)
+        : thread.messages;
+    const messages = held.slice(0, AGENT_SESSION_PREVIEW_MESSAGES).map((message) => ({
+      role: message.role,
+      text:
+        message.text.length > AGENT_SESSION_PREVIEW_CHARACTERS
+          ? `${message.text.slice(0, AGENT_SESSION_PREVIEW_CHARACTERS).trimEnd()}…`
+          : message.text,
+    }));
+    return { messages, more: thread.messages.length > messages.length };
+  });
+
+  return AgentSessionCatalog.of({
+    list,
+    hydrate,
+    importSessions,
+    preview,
+    index,
+    banish,
+    restore,
+    banished,
+  });
 });
 
 export const layer = Layer.effect(AgentSessionCatalog, make);

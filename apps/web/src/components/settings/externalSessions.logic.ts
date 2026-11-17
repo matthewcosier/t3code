@@ -5,7 +5,10 @@ import {
   type AgentSessionCatalogEntry,
   type AgentSessionCatalogInput,
   type AgentSessionCatalogResult,
+  type AgentSessionFilter,
+  type AgentSessionRef,
   type AgentSessionSource,
+  type AgentSessionWindow,
 } from "@t3tools/contracts";
 import * as Cause from "effect/Cause";
 import { AsyncResult } from "effect/reactivity";
@@ -145,13 +148,31 @@ export function externalViewCounts(
   );
 }
 
-type PageScope = Pick<AgentSessionCatalogInput, "activeFrom" | "activeUntil">;
+type PageScope = Pick<AgentSessionCatalogInput, "activeFrom" | "activeUntil" | "filter">;
+
+/**
+ * The filter the list asks with: the search text trimmed and the tools chosen, or none when both
+ * are empty, so an empty search reads the same pages as no search.
+ */
+export function externalFilter(
+  search: string,
+  sources: ReadonlyArray<AgentSessionSource>,
+): AgentSessionFilter | undefined {
+  const text = search.trim();
+  if (text === "" && sources.length === 0) return undefined;
+  return {
+    ...(text === "" ? {} : { search: text }),
+    ...(sources.length === 0 ? {} : { sources: [...sources].toSorted() }),
+  };
+}
 
 /** The request that counts every group and the banish presets; it alone starts index passes. */
 export function externalSummaryInput(
   groups: ReadonlyArray<ExternalGroup>,
+  filter?: AgentSessionFilter,
 ): AgentSessionCatalogInput {
   return {
+    ...(filter === undefined ? {} : { filter }),
     limit: 0,
     refresh: true,
     groupBounds: groups.flatMap((group, index) =>
@@ -168,9 +189,11 @@ export function externalSummaryInput(
 export function externalGroupPageInputs(input: {
   readonly group: ExternalGroup;
   readonly cursors: ReadonlyArray<AgentSessionCatalogCursor>;
+  readonly filter?: AgentSessionFilter | undefined;
 }): ReadonlyArray<AgentSessionCatalogInput> {
   const { group, cursors } = input;
   const scope: PageScope = {
+    ...(input.filter === undefined ? {} : { filter: input.filter }),
     ...(group.activeFrom === undefined ? {} : { activeFrom: group.activeFrom }),
     ...(group.activeUntil === undefined ? {} : { activeUntil: group.activeUntil }),
   };
@@ -205,8 +228,11 @@ export function externalListRequests(input: {
   /** Groups whose rows are read: the open ones. */
   readonly listed: ReadonlySet<string>;
   readonly cursors: Readonly<Record<string, ReadonlyArray<AgentSessionCatalogCursor>>>;
+  readonly filter?: AgentSessionFilter | undefined;
 }): ExternalListRequests {
-  const inputs: Array<AgentSessionCatalogInput> = [externalSummaryInput(input.groups)];
+  const inputs: Array<AgentSessionCatalogInput> = [
+    externalSummaryInput(input.groups, input.filter),
+  ];
   const groupPages: Array<{ groupId: string; start: number; end: number }> = [];
   for (const group of input.groups) {
     if (!input.listed.has(group.id)) continue;
@@ -215,6 +241,7 @@ export function externalListRequests(input: {
       ...externalGroupPageInputs({
         group,
         cursors: input.cursors[group.id] ?? [],
+        filter: input.filter,
       }),
     );
     groupPages.push({ groupId: group.id, start, end: inputs.length });
@@ -229,6 +256,50 @@ export function externalCursorAfter(entry: AgentSessionCatalogEntry): AgentSessi
     providerInstanceId: entry.providerInstanceId,
     filePath: entry.filePath,
   };
+}
+
+const sameCursor = (left: AgentSessionCatalogCursor, right: AgentSessionCatalogCursor) =>
+  left.lastActiveAt === right.lastActiveAt &&
+  left.providerInstanceId === right.providerInstanceId &&
+  left.filePath === right.filePath;
+
+/**
+ * Where each banished page after the first is read from: right after the last row of the page
+ * before it as read now, so no session falls between pages, until `shown` rows are loaded.
+ * `answers` holds the first page's answer, then one per cursor in `cursors`.
+ */
+export function externalBanishedCursors(input: {
+  readonly answers: ReadonlyArray<{
+    readonly entries: ReadonlyArray<AgentSessionCatalogEntry>;
+    readonly totalCount: number;
+  }>;
+  readonly cursors: ReadonlyArray<AgentSessionCatalogCursor>;
+  readonly shown: number;
+}): ReadonlyArray<AgentSessionCatalogCursor> {
+  const totalCount = input.answers[0]?.totalCount ?? 0;
+  const cursors: Array<AgentSessionCatalogCursor> = [];
+  let loaded = 0;
+  for (const [index, answer] of input.answers.entries()) {
+    loaded += answer.entries.length;
+    const last = answer.entries.at(-1);
+    if (last === undefined || loaded >= input.shown || loaded >= totalCount) break;
+    const cursor = externalCursorAfter(last);
+    cursors.push(cursor);
+    const readFrom = input.cursors[index];
+    // The next page was read from elsewhere, or not yet: it is read again from here.
+    if (readFrom === undefined || !sameCursor(readFrom, cursor)) break;
+  }
+  return cursors;
+}
+
+/** Whether two lists of cursors read the same pages. */
+export function externalSameCursors(
+  left: ReadonlyArray<AgentSessionCatalogCursor>,
+  right: ReadonlyArray<AgentSessionCatalogCursor>,
+): boolean {
+  return (
+    left.length === right.length && left.every((cursor, index) => sameCursor(cursor, right[index]!))
+  );
 }
 
 export interface ExternalGroupView {
@@ -530,6 +601,11 @@ const SOURCE_NAMES: Record<AgentSessionSource, string> = {
   pi: "Pi",
 };
 
+/** The name of the tool that ran the session. */
+export function externalEntrySourceName(entry: AgentSessionCatalogEntry): string {
+  return SOURCE_NAMES[entry.source];
+}
+
 /** Which tool ran the session and where, for the row's tooltip. */
 export function externalEntryOrigin(entry: AgentSessionCatalogEntry): string {
   return `${SOURCE_NAMES[entry.source]} in ${entry.cwd ?? entry.projectRoot}`;
@@ -571,41 +647,218 @@ export function externalBanishPresets(
   }));
 }
 
+/** A row ticked or unticked by hand: its session, and the group it sat in when clicked. */
+export interface ExternalSelectedRow {
+  readonly ref: AgentSessionRef;
+  readonly groupId: string | undefined;
+}
+
+/**
+ * What is ticked. The server takes a session when it is ticked by hand or inside a whole group's
+ * span, and not unticked, so every ticked and unticked row is sent as itself wherever it sits now.
+ */
 export interface ExternalSelection {
+  /** Rows ticked one by one. */
   readonly keys: ReadonlySet<string>;
-  /** Where a shift-click range starts: the last row clicked with a modifier. */
+  /** Whole groups, by id: every session in the group's span, shown on screen or not. */
+  readonly groups: ReadonlySet<string>;
+  /** Rows unticked inside a whole group. */
+  readonly excluded: ReadonlySet<string>;
+  /** Each row clicked: the session it is, and the group it was in, for counts while off screen. */
+  readonly rows: ReadonlyMap<string, ExternalSelectedRow>;
+  /** Where a shift-click range starts: the last row clicked. */
   readonly anchor: string | null;
 }
 
-export const NO_EXTERNAL_SELECTION: ExternalSelection = { keys: new Set(), anchor: null };
+export const NO_EXTERNAL_SELECTION: ExternalSelection = {
+  keys: new Set(),
+  groups: new Set(),
+  excluded: new Set(),
+  rows: new Map(),
+  anchor: null,
+};
+
+export function externalIsSelected(
+  selection: ExternalSelection,
+  key: string,
+  groupId: string | undefined,
+): boolean {
+  if (selection.excluded.has(key)) return false;
+  return selection.keys.has(key) || (groupId !== undefined && selection.groups.has(groupId));
+}
+
+/** Whether the selection takes anything: a row ticked by hand or a whole group. */
+export function externalSelectionTakesAny(selection: ExternalSelection): boolean {
+  return selection.keys.size > 0 || selection.groups.size > 0;
+}
 
 /**
  * A row's checkbox toggles that row; with Shift it selects every row between the anchor and this
- * one, in the order shown.
+ * one, in the order shown. Inside a whole group, unticking a row leaves it out of the group.
  */
 export function externalSelectionAfterClick(
   selection: ExternalSelection,
   click: {
     readonly key: string;
     readonly orderedKeys: ReadonlyArray<string>;
+    /** The group each row on screen sits in. */
+    readonly groupOf: (key: string) => string | undefined;
+    /** The session each row on screen is. */
+    readonly refOf: (key: string) => AgentSessionRef | undefined;
     readonly range: boolean;
   },
 ): ExternalSelection {
+  const keys = new Set(selection.keys);
+  const excluded = new Set(selection.excluded);
+  const rows = new Map(selection.rows);
+  const remember = (key: string) => {
+    const ref = click.refOf(key);
+    if (ref !== undefined) rows.set(key, { ref, groupId: click.groupOf(key) });
+  };
+  // Ticking a row always takes it out of the unticked, wherever it was unticked.
+  const select = (key: string) => {
+    remember(key);
+    excluded.delete(key);
+    const groupId = click.groupOf(key);
+    if (groupId === undefined || !selection.groups.has(groupId)) keys.add(key);
+  };
+  const unselect = (key: string) => {
+    remember(key);
+    keys.delete(key);
+    const groupId = click.groupOf(key);
+    if (groupId !== undefined && selection.groups.has(groupId)) excluded.add(key);
+  };
   if (click.range && selection.anchor !== null) {
     const from = click.orderedKeys.indexOf(selection.anchor);
     const to = click.orderedKeys.indexOf(click.key);
     if (from >= 0 && to >= 0) {
       const [start, end] = from <= to ? [from, to] : [to, from];
-      return {
-        keys: new Set([...selection.keys, ...click.orderedKeys.slice(start, end + 1)]),
-        anchor: selection.anchor,
-      };
+      for (const key of click.orderedKeys.slice(start, end + 1)) select(key);
+      return { keys, groups: selection.groups, excluded, rows, anchor: selection.anchor };
     }
   }
-  const keys = new Set(selection.keys);
-  if (keys.has(click.key)) keys.delete(click.key);
-  else keys.add(click.key);
-  return { keys, anchor: click.key };
+  if (externalIsSelected(selection, click.key, click.groupOf(click.key))) unselect(click.key);
+  else select(click.key);
+  return { keys, groups: selection.groups, excluded, rows, anchor: click.key };
+}
+
+/**
+ * The group a ticked or unticked row is in as far as the screen knows: the group it shows in, else
+ * the one it was clicked in. Only counts and header boxes read it; what is sent never does.
+ */
+function externalKnownGroup(
+  selection: ExternalSelection,
+  view: ExternalListView | null,
+): (key: string) => string | undefined {
+  const shownIn = new Map<string, string>();
+  for (const groupView of view?.groups ?? []) {
+    for (const entry of groupView.entries ?? []) {
+      shownIn.set(externalEntryKey(entry), groupView.group.id);
+    }
+  }
+  return (key) => shownIn.get(key) ?? selection.rows.get(key)?.groupId;
+}
+
+/**
+ * A group header's checkbox: the whole group, part of it, or none of it, counting the rows ticked
+ * or left out in it whether or not they are on screen.
+ */
+export function externalGroupCheck(
+  selection: ExternalSelection,
+  groupId: string,
+  view: ExternalListView | null,
+): "all" | "some" | "none" {
+  const count = view?.groups.find((groupView) => groupView.group.id === groupId)?.count ?? 0;
+  const groupOf = externalKnownGroup(selection, view);
+  const inGroup = (keys: ReadonlySet<string>) =>
+    [...keys].filter((key) => groupOf(key) === groupId).length;
+  if (selection.groups.has(groupId)) {
+    const left = inGroup(selection.excluded);
+    if (left === 0) return "all";
+    return left >= count ? "none" : "some";
+  }
+  const ticked = [...selection.keys].filter(
+    (key) => groupOf(key) === groupId && !selection.excluded.has(key),
+  ).length;
+  if (ticked === 0) return "none";
+  return ticked >= count ? "all" : "some";
+}
+
+/** Ticking a group header takes the whole group, shown or not; unticking a whole one clears it. */
+export function externalSelectionAfterGroupClick(
+  selection: ExternalSelection,
+  groupId: string,
+  view: ExternalListView | null,
+): ExternalSelection {
+  const whole = externalGroupCheck(selection, groupId, view) === "all";
+  const groupOf = externalKnownGroup(selection, view);
+  const outside = (key: string) => groupOf(key) !== groupId;
+  const groups = new Set(selection.groups);
+  if (whole) groups.delete(groupId);
+  else groups.add(groupId);
+  return {
+    keys: new Set([...selection.keys].filter(outside)),
+    groups,
+    excluded: new Set([...selection.excluded].filter(outside)),
+    rows: selection.rows,
+    anchor: selection.anchor,
+  };
+}
+
+/** The selection with these rows taken out, as when they leave the list; the rest stays ticked. */
+export function externalSelectionWithout(
+  selection: ExternalSelection,
+  leaving: ReadonlySet<string>,
+): ExternalSelection {
+  return {
+    keys: new Set([...selection.keys].filter((key) => !leaving.has(key))),
+    groups: selection.groups,
+    excluded: new Set([...selection.excluded].filter((key) => !leaving.has(key))),
+    rows: new Map([...selection.rows].filter(([key]) => !leaving.has(key))),
+    anchor: selection.anchor !== null && leaving.has(selection.anchor) ? null : selection.anchor,
+  };
+}
+
+/**
+ * What the selection takes, as the server reads it: every row ticked by hand and every row
+ * unticked, as themselves wherever they are now, and each whole group the list shows by its span.
+ * `count` is how many that is as far as the screen knows; the server's answer is the real one.
+ */
+export function externalSelectionChoice(
+  selection: ExternalSelection,
+  view: ExternalListView | null,
+): {
+  readonly sessions: ReadonlyArray<AgentSessionRef>;
+  readonly windows: ReadonlyArray<AgentSessionWindow>;
+  readonly exclude: ReadonlyArray<AgentSessionRef>;
+  readonly count: number;
+} {
+  const refs = (keys: Iterable<string>) =>
+    [...keys].flatMap((key) => {
+      const row = selection.rows.get(key);
+      return row === undefined ? [] : [row.ref];
+    });
+  const groupOf = externalKnownGroup(selection, view);
+  const sessions = refs([...selection.keys].filter((key) => !selection.excluded.has(key)));
+  const exclude = refs(selection.excluded);
+  const windows: Array<AgentSessionWindow> = [];
+  let count = 0;
+  for (const groupView of view?.groups ?? []) {
+    const { group } = groupView;
+    if (!selection.groups.has(group.id)) continue;
+    windows.push({
+      ...(group.activeFrom === undefined ? {} : { activeFrom: group.activeFrom }),
+      ...(group.activeUntil === undefined ? {} : { activeUntil: group.activeUntil }),
+    });
+    const left = [...selection.excluded].filter((key) => groupOf(key) === group.id).length;
+    count += Math.max(0, groupView.count - left);
+  }
+  for (const key of selection.keys) {
+    if (selection.excluded.has(key)) continue;
+    const groupId = groupOf(key);
+    if (groupId === undefined || !selection.groups.has(groupId)) count += 1;
+  }
+  return { sessions, windows, exclude, count };
 }
 
 /** The server's own reason when it refused the open, else a plain failure. */

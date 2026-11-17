@@ -41,7 +41,7 @@ const writeSessions = Effect.fn("external.writeBanishSessions")(function* (works
 });
 
 test(
-  "Old external sessions banish by age, one at a time or as a selection, and restore",
+  "External sessions search, banish by age, one at a time or as a selection, and restore",
   WEB,
   async ({ t3, app, browser, screen }) => {
     const project = await runPromise(outsideProject("ledger"));
@@ -60,6 +60,24 @@ test(
       await atRest(browser);
       await app.screenshot("external-sessions-page");
 
+      // When the list is searched, only the sessions whose title matches stay, whatever the case,
+      const search = screen.getByTestId("external-sessions-search");
+      await search.fill("readme");
+      await expect(externalRows).toHaveCount(1, { timeout: 10_000 });
+      await expect(row("Tidy the README")).toBeVisible();
+      // and when only another tool's sessions are asked for, none match.
+      await screen.getByRole("button", "Codex").tap();
+      await expect(screen.getByTestId("external-sessions-none-match")).toBeVisible({
+        timeout: 10_000,
+      });
+      await expect(externalRows).toHaveCount(0);
+      await atRest(browser);
+      await app.screenshot("none-match");
+      // Clearing both lists every session again.
+      await screen.getByRole("button", "All").tap();
+      await search.clear();
+      await expect(externalRows).toHaveCount(SESSIONS.length, { timeout: 10_000 });
+
       // Given everything last active more than three months ago is banished from the menu,
       await screen.getByTestId("external-sessions-banish").tap();
       await atRest(browser);
@@ -74,15 +92,15 @@ test(
       await screen.getByRole("button", "Undo").tap();
       await expect(externalRows).toHaveCount(SESSIONS.length);
 
-      // When one session is banished from its row,
-      await screen.getByRole("button", "Banish Tidy the README").tap();
-      await expect(row("Tidy the README")).toHaveCount(0);
-
-      // and two more are ticked and banished together,
+      // When two sessions are ticked and a third is banished from its row, the ticks stay,
       await screen.getByRole("checkbox", "Select Rotate the API keys").tap();
       await screen.getByRole("checkbox", "Select Draft the changelog").tap();
+      await screen.getByRole("button", "Banish Tidy the README").tap();
+      await expect(row("Tidy the README")).toHaveCount(0);
+      await expect(screen.getByTestId("external-sessions-selected-count")).toContainText("2");
       await atRest(browser);
       await app.screenshot("two-selected");
+      // and the two ticked are banished together.
       await screen.getByTestId("external-sessions-banish-selected").tap();
       await expect(row("Rotate the API keys")).toHaveCount(0);
       await expect(row("Draft the changelog")).toHaveCount(0);
@@ -112,6 +130,18 @@ test(
       await browser.evaluate(() => window.dispatchEvent(new Event("focus")));
       await expect(row("Draft the changelog")).toBeVisible({ timeout: 30_000 });
       await expect(restore).toHaveCount(1, { timeout: 30_000 });
+
+      // And Restore all, once confirmed, puts every banished session back in the list.
+      await screen.getByRole("button", "Banish Port the old importer").tap();
+      await expect(restore).toHaveCount(2, { timeout: 30_000 });
+      await expect(externalRows).toHaveCount(SESSIONS.length - 2);
+      await screen.getByTestId("banished-restore-all").tap();
+      await expect(screen.getByTestId("banished-restore-all-confirm")).toBeVisible();
+      await atRest(browser);
+      await app.screenshot("restore-all-confirm");
+      await screen.getByTestId("banished-restore-all-confirm").tap();
+      await expect(restore).toHaveCount(0, { timeout: 30_000 });
+      await expect(externalRows).toHaveCount(SESSIONS.length, { timeout: 30_000 });
     } finally {
       await runPromise(settings.restore);
       await runPromise(project.remove);

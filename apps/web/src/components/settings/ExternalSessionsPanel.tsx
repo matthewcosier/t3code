@@ -1,14 +1,16 @@
 import { useAtomValue } from "@effect/atom-react";
 import type {
   AgentSessionBanishInput,
+  AgentSessionImportExternalInput,
   AgentSessionCatalogCursor,
   AgentSessionCatalogEntry,
+  AgentSessionSource,
   EnvironmentId,
 } from "@t3tools/contracts";
 import { useNavigate } from "@tanstack/react-router";
 import { AsyncResult } from "effect/reactivity";
 import * as Schema from "effect/Schema";
-import { ChevronDownIcon, ChevronRightIcon, GhostIcon } from "lucide-react";
+import { ChevronDownIcon, ChevronRightIcon, EyeIcon, GhostIcon, SearchIcon } from "lucide-react";
 import { useEffect, useEffectEvent, useState, useSyncExternalStore, type ReactNode } from "react";
 
 import { useLocalStorage } from "../../hooks/useLocalStorage";
@@ -28,11 +30,13 @@ import {
   agentSessionCatalogPages,
   agentSessionCatalogPagesKey,
   agentSessionHydrate,
-  agentSessionImportRecent,
+  agentSessionImportExternal,
+  agentSessionPreview,
   agentSessionRestore,
 } from "../../state/agentSessions";
 import { useQuietThreadShells } from "../../state/entities";
 import { usePrimaryEnvironmentId } from "../../state/environments";
+import { useEnvironmentQuery } from "../../state/query";
 import { useAtomCommand } from "../../state/use-atom-command";
 import { RelativeTime } from "../RelativeTime";
 import {
@@ -46,6 +50,7 @@ import {
 } from "../ui/alert-dialog";
 import { Button } from "../ui/button";
 import { Checkbox } from "../ui/checkbox";
+import { InputGroup, InputGroupAddon, InputGroupInput } from "../ui/input-group";
 import {
   Menu,
   MenuGroup,
@@ -58,6 +63,7 @@ import {
 import { Spinner } from "../ui/spinner";
 import { Switch } from "../ui/switch";
 import { toastManager } from "../ui/toast";
+import { Toggle, ToggleGroup } from "../ui/toggle-group";
 import { Tooltip, TooltipPopup, TooltipTrigger } from "../ui/tooltip";
 import { BanishedSessions } from "./BanishedSessions";
 import {
@@ -69,12 +75,16 @@ import {
   externalEntryKey,
   externalEntryOrigin,
   externalEntryPlace,
+  externalEntrySourceName,
   externalEntryTitle,
   externalFallbackToRemember,
+  externalFilter,
+  externalGroupCheck,
   externalGroupFooter,
   externalGroupPageInputs,
   externalGroups,
   externalImportWindow,
+  externalIsSelected,
   externalLaggingPages,
   externalListMoving,
   externalListRequests,
@@ -84,6 +94,10 @@ import {
   externalOpenGroups,
   externalRefreshDue,
   externalSelectionAfterClick,
+  externalSelectionAfterGroupClick,
+  externalSelectionChoice,
+  externalSelectionTakesAny,
+  externalSelectionWithout,
   externalSettledAnswer,
   externalShownOpenGroups,
   externalShownView,
@@ -105,6 +119,25 @@ const EXTERNAL_GROUPS_OPEN_KEY = "t3code:settings:external-groups-open";
 const ChosenGroups = Schema.Record(Schema.String, Schema.Boolean);
 const NO_CHOSEN_GROUPS: Readonly<Record<string, boolean>> = {};
 const NO_GROUP_CURSORS: Readonly<Record<string, ReadonlyArray<AgentSessionCatalogCursor>>> = {};
+
+/** How long typing pauses before the search reaches the list. */
+const SEARCH_PAUSE_MS = 300;
+/** The settings page's own scroll area. */
+const SETTINGS_SCROLL_SELECTOR = "[data-settings-page-scroll]";
+/** Where the list was scrolled when a session was opened from it, for when the person comes back. */
+const returnScroll: { top: number | null } = { top: null };
+/** Remembers the page's scroll before leaving it for a thread. */
+function rememberReturnScroll() {
+  returnScroll.top =
+    document.querySelector<HTMLElement>(SETTINGS_SCROLL_SELECTOR)?.scrollTop ?? null;
+}
+/** Puts the page's scroll back where it was left, once. */
+function restoreReturnScroll() {
+  const top = returnScroll.top;
+  returnScroll.top = null;
+  const container = document.querySelector<HTMLElement>(SETTINGS_SCROLL_SELECTOR);
+  if (top !== null && container !== null) container.scrollTop = top;
+}
 
 const sessionCount = (count: number) =>
   count === 1 ? "1 session" : `${count.toLocaleString()} sessions`;
@@ -162,7 +195,7 @@ function ExternalSessionList(props: {
   const { environmentId } = props;
   const navigate = useNavigate();
   const hydrate = useAtomCommand(agentSessionHydrate, { reportFailure: false });
-  const importRecent = useAtomCommand(agentSessionImportRecent, { reportFailure: false });
+  const importSessions = useAtomCommand(agentSessionImportExternal, { reportFailure: false });
   const banishSessions = useAtomCommand(agentSessionBanish, { reportFailure: false });
   const restoreSessions = useAtomCommand(agentSessionRestore, { reportFailure: false });
   const [selection, setSelection] = useState<ExternalSelection>(NO_EXTERNAL_SELECTION);
@@ -171,7 +204,23 @@ function ExternalSessionList(props: {
     NO_CHOSEN_GROUPS,
     ChosenGroups,
   );
-  const scopeKey = environmentId;
+  const [search, setSearch] = useState("");
+  const [sources, setSources] = useState<ReadonlyArray<AgentSessionSource>>([]);
+  // The list asks again once typing pauses, not on every key.
+  const [askedSearch, setAskedSearch] = useState("");
+  // oxlint-disable-next-line t3code/no-unreasoned-state-sync -- waits for a pause in typing before the search reaches the requests
+  useEffect(() => {
+    const timer = setTimeout(() => setAskedSearch(search), SEARCH_PAUSE_MS);
+    return () => clearTimeout(timer);
+  }, [search]);
+  const filter = externalFilter(askedSearch, sources);
+  // A new filter is a new list: its own pages, its own rows on screen and no ticks carried over.
+  const scopeKey = JSON.stringify([environmentId, filter ?? null]);
+  const [selectionScope, setSelectionScope] = useState(scopeKey);
+  if (selectionScope !== scopeKey) {
+    setSelectionScope(scopeKey);
+    setSelection(NO_EXTERNAL_SELECTION);
+  }
   const [pages, setPages] = useState({ scopeKey, cursors: NO_GROUP_CURSORS });
   const cursors = pages.scopeKey === scopeKey ? pages.cursors : NO_GROUP_CURSORS;
   const [openGate] = useState(createExternalOpenGate);
@@ -193,7 +242,9 @@ function ExternalSessionList(props: {
   const groups = externalGroups(nowMinute);
   // The summary counts every group; which groups are open depends on those counts.
   const summary = AsyncResult.getOrElse(
-    useAtomValue(agentSessionCatalog({ environmentId, input: externalSummaryInput(groups) })),
+    useAtomValue(
+      agentSessionCatalog({ environmentId, input: externalSummaryInput(groups, filter) }),
+    ),
     () => null,
   );
   // Until a new summary answers (new group bounds at midnight), the counts on screen stand in, so
@@ -203,7 +254,7 @@ function ExternalSessionList(props: {
     summary?.groupCounts ?? externalViewCounts(groups, keptView),
     chosenGroups,
   );
-  const requests = externalListRequests({ groups, listed: openGroups, cursors });
+  const requests = externalListRequests({ groups, listed: openGroups, cursors, filter });
   const { inputs } = requests;
   const pagesKey = agentSessionCatalogPagesKey(environmentId, inputs);
   const results = useAtomValue(agentSessionCatalogPages(pagesKey));
@@ -248,6 +299,13 @@ function ExternalSessionList(props: {
     }
   }, [fallbackGroup, setChosenGroups]);
 
+  // Back from a session opened here, the list scrolls to where it was once its rows are on screen.
+  const rowsShown = view !== null;
+  // oxlint-disable-next-line t3code/no-unreasoned-state-sync -- puts the page scroll back where it was before a session was opened from it
+  useEffect(() => {
+    if (rowsShown) restoreReturnScroll();
+  }, [rowsShown]);
+
   // Sessions change outside the app: coming back to the window, each minute the page is in view,
   // a change to the threads this server holds and a finished open or import all re-read what the
   // list shows.
@@ -281,7 +339,7 @@ function ExternalSessionList(props: {
     // paged; marking it stale means it never brings back a session that has left the list.
     const shown = new Set(inputs.map((input) => JSON.stringify(input)));
     for (const group of groups) {
-      const [firstPage] = externalGroupPageInputs({ group, cursors: [] });
+      const [firstPage] = externalGroupPageInputs({ group, cursors: [], filter });
       if (firstPage === undefined || shown.has(JSON.stringify(firstPage))) continue;
       appAtomRegistry.refresh(agentSessionCatalog({ environmentId, input: firstPage }));
     }
@@ -331,6 +389,8 @@ function ExternalSessionList(props: {
   const open = (entry: AgentSessionCatalogEntry) => {
     const key = externalEntryKey(entry);
     if (!openGate.tryEnter(key)) return;
+    // Coming back to the page after the thread puts the list where it was.
+    rememberReturnScroll();
     setOpeningKey(key);
     // Held until the window has moved, so a second click cannot race the first to land.
     const release = () => {
@@ -341,13 +401,13 @@ function ExternalSessionList(props: {
   };
 
   const importWindow = externalImportWindow(groups, view);
-  const runImport = async (activeFrom: string) => {
-    setConfirmingImport(false);
+  const importNow = async (input: AgentSessionImportExternalInput, fromSelection: boolean) => {
     setImporting(true);
-    const result = await importRecent({ environmentId, input: { activeFrom } });
+    const result = await importSessions({ environmentId, input });
     setImporting(false);
     // Imported sessions leave the list.
     setRefreshRequests((count) => count + 1);
+    if (result._tag === "Success" && fromSelection) setSelection(NO_EXTERNAL_SELECTION);
     if (result._tag === "Failure") {
       toastManager.add({
         type: "error",
@@ -356,8 +416,20 @@ function ExternalSessionList(props: {
       });
       return;
     }
-    const { importedCount, skippedCount } = result.value;
-    toastManager.add({
+    const { importedCount, skippedCount, threadIds } = result.value;
+    const where =
+      importedCount === 0
+        ? null
+        : importedCount === 1
+          ? "It is in the sidebar under Settled."
+          : "They are in the sidebar under Settled.";
+    const skipped =
+      skippedCount === 0
+        ? null
+        : `${sessionCount(skippedCount)} could not be imported: gone from disk, empty, or no folder to open them in.`;
+    const description = [where, skipped].filter((part) => part !== null).join(" ");
+    const onlyThread = importedCount === 1 && threadIds.length === 1 ? threadIds[0] : undefined;
+    const toastId = toastManager.add({
       type: importedCount === 0 && skippedCount > 0 ? "error" : "success",
       title:
         importedCount > 0
@@ -365,15 +437,34 @@ function ExternalSessionList(props: {
           : skippedCount > 0
             ? "Could not import sessions"
             : "Nothing to import",
-      ...(skippedCount > 0
-        ? {
-            description: `${sessionCount(skippedCount)} could not be imported: gone from disk, or no folder to open them in.`,
-          }
-        : {}),
+      ...(description === "" ? {} : { description }),
+      ...(onlyThread === undefined
+        ? {}
+        : {
+            actionProps: {
+              children: "Open",
+              onClick: () => {
+                toastManager.close(toastId);
+                rememberReturnScroll();
+                void navigate({
+                  to: "/$environmentId/$threadId",
+                  params: { environmentId, threadId: onlyThread },
+                });
+              },
+            },
+          }),
     });
   };
+  // One import or open at a time, held until it lands, so a second press cannot start another.
+  const runImport = (input: AgentSessionImportExternalInput, fromSelection: boolean) => {
+    setConfirmingImport(false);
+    if (!openGate.tryEnter("import")) return;
+    const release = () => openGate.leave();
+    void importNow(input, fromSelection).then(release, release);
+  };
 
-  const banish = async (input: AgentSessionBanishInput) => {
+  /** `leaving` names the rows the banish takes, to untick just them; null clears every tick. */
+  const banish = async (input: AgentSessionBanishInput, leaving: ReadonlySet<string> | null) => {
     const result = await banishSessions({ environmentId, input });
     if (result._tag === "Failure") {
       toastManager.add({
@@ -383,7 +474,9 @@ function ExternalSessionList(props: {
       });
       return;
     }
-    setSelection(NO_EXTERNAL_SELECTION);
+    setSelection((current) =>
+      leaving === null ? NO_EXTERNAL_SELECTION : externalSelectionWithout(current, leaving),
+    );
     const { batchId, count } = result.value;
     if (count === 0) return;
     const toastId = toastManager.add({
@@ -413,16 +506,36 @@ function ExternalSessionList(props: {
       },
     });
   };
-  const sessionRefs = (entries: ReadonlyArray<AgentSessionCatalogEntry>) =>
-    entries.map(({ providerInstanceId, filePath }) => ({ providerInstanceId, filePath }));
   const orderedKeys = view?.entries.map(externalEntryKey) ?? [];
-  const selectedEntries =
-    view?.entries.filter((entry) => selection.keys.has(externalEntryKey(entry))) ?? [];
+  const groupOfKey = new Map(
+    (view?.groups ?? []).flatMap((groupView) =>
+      (groupView.entries ?? []).map(
+        (entry) => [externalEntryKey(entry), groupView.group.id] as const,
+      ),
+    ),
+  );
+  const groupOf = (key: string) => groupOfKey.get(key);
+  const refOfKey = new Map(
+    (view?.entries ?? []).map(
+      (entry) =>
+        [
+          externalEntryKey(entry),
+          { providerInstanceId: entry.providerInstanceId, filePath: entry.filePath },
+        ] as const,
+    ),
+  );
+  const refOf = (key: string) => refOfKey.get(key);
+  const choice = externalSelectionChoice(selection, view);
+  const choiceInput = {
+    sessions: choice.sessions,
+    windows: choice.windows,
+    exclude: choice.exclude,
+    ...(filter === undefined ? {} : { filter }),
+  };
 
   const toggleGroup = (group: ExternalGroup) => {
     const isOpen = shownOpen.has(group.id);
     setChosenGroups((chosen) => ({ ...chosen, [group.id]: !isOpen }));
-    setSelection(NO_EXTERNAL_SELECTION);
     if (isOpen) {
       // A closed group drops its extra pages, so it opens again on its first page.
       setPages({ scopeKey, cursors: { ...cursors, [group.id]: [] } });
@@ -432,7 +545,15 @@ function ExternalSessionList(props: {
   const status = externalListStatus({ shown: view, failed });
   const reading = view?.indexing === true || settled.some((answer) => answer?.indexing === true);
   const presets = externalBanishPresets(view);
-  const busy = importing || openingKey !== null;
+  // An import from another window holds this one's actions too, and shows how far it has got.
+  const progress = summary?.importing ?? null;
+  const busy = importing || openingKey !== null || progress !== null;
+  const importLabel =
+    progress !== null
+      ? `Importing ${progress.done.toLocaleString()} of ${progress.total.toLocaleString()}`
+      : importing
+        ? "Importing"
+        : null;
 
   return (
     <>
@@ -460,12 +581,11 @@ function ExternalSessionList(props: {
               disabled={busy || importWindow === null || importWindow.count === 0}
               onClick={() => setConfirmingImport(true)}
             >
-              {importing ? <Spinner aria-hidden size="xs" /> : null}
-              {importing
-                ? "Importing"
-                : importWindow === null || importWindow.count === 0
+              {importLabel !== null ? <Spinner aria-hidden size="xs" /> : null}
+              {importLabel ??
+                (importWindow === null || importWindow.count === 0
                   ? "Import"
-                  : `Import ${importWindow.count.toLocaleString()}`}
+                  : `Import ${importWindow.count.toLocaleString()}`)}
             </Button>
           }
         />
@@ -476,7 +596,12 @@ function ExternalSessionList(props: {
             <BanishMenu
               presets={presets}
               disabled={busy || presets.every((preset) => preset.count === 0)}
-              onBanishOlderThan={(months) => void banish({ kind: "olderThan", months })}
+              onBanishOlderThan={(months) =>
+                void banish(
+                  { kind: "olderThan", months, ...(filter === undefined ? {} : { filter }) },
+                  null,
+                )
+              }
             />
           }
         />
@@ -496,7 +621,16 @@ function ExternalSessionList(props: {
             <Button
               data-testid="external-sessions-import-confirm"
               onClick={() => {
-                if (importWindow !== null) void runImport(importWindow.activeFrom);
+                if (importWindow !== null) {
+                  runImport(
+                    {
+                      sessions: [],
+                      windows: [{ activeFrom: importWindow.activeFrom }],
+                      ...(filter === undefined ? {} : { filter }),
+                    },
+                    false,
+                  );
+                }
               }}
             >
               Import
@@ -506,14 +640,24 @@ function ExternalSessionList(props: {
       </AlertDialog>
 
       <section aria-label="Sessions" className="flex flex-col gap-4">
-        {selectedEntries.length > 0 ? (
+        <ExternalFilterBar
+          search={search}
+          sources={sources}
+          onSearch={setSearch}
+          onSources={setSources}
+        />
+
+        {externalSelectionTakesAny(selection) ? (
           <div
             role="region"
             aria-label="Selected sessions"
             className="sticky top-2 z-10 flex flex-wrap items-center justify-between gap-3 rounded-xl border border-border/60 bg-popover px-3 py-2 shadow-sm sm:px-4"
           >
-            <span className="text-sm text-foreground">
-              {selectedEntries.length.toLocaleString()} selected
+            <span
+              className="text-sm text-foreground"
+              data-testid="external-sessions-selected-count"
+            >
+              {choice.count.toLocaleString()} selected
             </span>
             <span className="flex items-center gap-2">
               <Button
@@ -528,14 +672,23 @@ function ExternalSessionList(props: {
                 type="button"
                 variant="outline"
                 size="sm"
+                data-testid="external-sessions-import-selected"
+                disabled={busy}
+                onClick={() => runImport(choiceInput, true)}
+              >
+                {importing ? <Spinner aria-hidden size="xs" /> : null}
+                Import {choice.count.toLocaleString()}
+              </Button>
+              <Button
+                type="button"
+                variant="outline"
+                size="sm"
                 data-testid="external-sessions-banish-selected"
                 disabled={busy}
-                onClick={() =>
-                  void banish({ kind: "sessions", sessions: sessionRefs(selectedEntries) })
-                }
+                onClick={() => void banish({ kind: "sessions", ...choiceInput }, null)}
               >
                 <GhostIcon aria-hidden className="size-3.5" />
-                Banish {selectedEntries.length.toLocaleString()}
+                Banish {choice.count.toLocaleString()}
               </Button>
             </span>
           </div>
@@ -550,6 +703,10 @@ function ExternalSessionList(props: {
               group={groupView}
               open={isOpen}
               onToggle={() => toggleGroup(group)}
+              check={externalGroupCheck(selection, group.id, view)}
+              onCheck={() =>
+                setSelection((current) => externalSelectionAfterGroupClick(current, group.id, view))
+              }
               footer={
                 isOpen
                   ? externalGroupFooter({
@@ -575,13 +732,20 @@ function ExternalSessionList(props: {
                 return (
                   <ExternalSessionRow
                     key={key}
+                    environmentId={environmentId}
                     entry={entry}
                     opening={openingKey === key}
                     waiting={busy && openingKey !== key}
-                    selected={selection.keys.has(key)}
+                    selected={externalIsSelected(selection, key, group.id)}
                     onSelect={(range) =>
                       setSelection((selected) =>
-                        externalSelectionAfterClick(selected, { key, orderedKeys, range }),
+                        externalSelectionAfterClick(selected, {
+                          key,
+                          orderedKeys,
+                          groupOf,
+                          refOf,
+                          range,
+                        }),
                       )
                     }
                     onOpen={() => {
@@ -589,7 +753,18 @@ function ExternalSessionList(props: {
                       open(entry);
                     }}
                     onBanish={() =>
-                      void banish({ kind: "sessions", sessions: sessionRefs([entry]) })
+                      void banish(
+                        {
+                          kind: "sessions",
+                          sessions: [
+                            {
+                              providerInstanceId: entry.providerInstanceId,
+                              filePath: entry.filePath,
+                            },
+                          ],
+                        },
+                        new Set([key]),
+                      )
                     }
                   />
                 );
@@ -616,10 +791,18 @@ function ExternalSessionList(props: {
                 }
               />
             ) : status === "empty" ? (
-              <SettingsRow
-                title="No external sessions"
-                description="Sessions you run in Claude Code, Codex or Pi outside T3 Code show up here."
-              />
+              filter === undefined ? (
+                <SettingsRow
+                  title="No external sessions"
+                  description="Sessions you run in Claude Code, Codex or Pi outside T3 Code show up here."
+                />
+              ) : (
+                <SettingsRow
+                  data-testid="external-sessions-none-match"
+                  title="No sessions match"
+                  description="Try other words, or all tools."
+                />
+              )
             ) : (
               <SettingsRow
                 role="status"
@@ -635,7 +818,11 @@ function ExternalSessionList(props: {
         )}
       </section>
 
-      <BanishedSessions environmentId={environmentId} revision={summary?.revision ?? null} />
+      <BanishedSessions
+        environmentId={environmentId}
+        revision={summary?.revision ?? null}
+        filter={filter}
+      />
     </>
   );
 }
@@ -645,6 +832,9 @@ function ExternalGroupBlock(props: {
   readonly group: ExternalGroupView;
   readonly open: boolean;
   readonly onToggle: () => void;
+  /** Whether the whole group, part of it or none of it is ticked. */
+  readonly check: "all" | "some" | "none";
+  readonly onCheck: () => void;
   readonly footer: ReturnType<typeof externalGroupFooter>;
   readonly onShowMore: () => void;
   readonly children: ReactNode;
@@ -653,7 +843,14 @@ function ExternalGroupBlock(props: {
   const { label } = group.group;
   return (
     <div className="space-y-2">
-      <h2 className="px-3 sm:px-4">
+      <h2 className="flex items-center gap-3 px-3 sm:px-4">
+        <Checkbox
+          checked={props.check === "all"}
+          indeterminate={props.check === "some"}
+          aria-label={`Select all of ${label}`}
+          data-testid="external-sessions-group-select"
+          onCheckedChange={() => props.onCheck()}
+        />
         <button
           type="button"
           data-testid="external-sessions-group"
@@ -752,6 +949,7 @@ function BanishMenu(props: {
 
 /** One session, laid out as a settings row with a checkbox in front for banishing several. */
 function ExternalSessionRow(props: {
+  readonly environmentId: EnvironmentId;
   readonly entry: AgentSessionCatalogEntry;
   readonly opening: boolean;
   /** Something else is opening or importing; this row waits. */
@@ -764,6 +962,7 @@ function ExternalSessionRow(props: {
 }) {
   const { entry } = props;
   const title = externalEntryTitle(entry);
+  const [previewOpen, setPreviewOpen] = useState(false);
   return (
     <div
       data-slot="settings-row"
@@ -804,6 +1003,24 @@ function ExternalSessionRow(props: {
             </p>
           </div>
           <div className="flex shrink-0 items-center gap-2">
+            <Tooltip>
+              <TooltipTrigger
+                render={
+                  <Button
+                    type="button"
+                    variant="ghost"
+                    size="icon-sm"
+                    data-testid="external-session-preview"
+                    aria-label={`Preview ${title}`}
+                    aria-expanded={previewOpen}
+                    onClick={() => setPreviewOpen((open) => !open)}
+                  />
+                }
+              >
+                <EyeIcon aria-hidden className="size-3.5" />
+              </TooltipTrigger>
+              <TooltipPopup>{previewOpen ? "Hide preview" : "Preview"}</TooltipPopup>
+            </Tooltip>
             <Button
               type="button"
               variant="outline"
@@ -839,6 +1056,106 @@ function ExternalSessionRow(props: {
           </div>
         </div>
       </div>
+      {previewOpen ? (
+        <ExternalSessionPreview environmentId={props.environmentId} entry={entry} />
+      ) : null}
+    </div>
+  );
+}
+
+/** The start of a session's conversation, read from its transcript when the preview opens. */
+function ExternalSessionPreview(props: {
+  readonly environmentId: EnvironmentId;
+  readonly entry: AgentSessionCatalogEntry;
+}) {
+  const { entry } = props;
+  const preview = useEnvironmentQuery(
+    agentSessionPreview({
+      environmentId: props.environmentId,
+      input: { providerInstanceId: entry.providerInstanceId, filePath: entry.filePath },
+    }),
+  );
+  const agent = externalEntrySourceName(entry);
+  return (
+    <div
+      data-testid="external-session-preview-panel"
+      className="mt-3 ml-7.5 space-y-2 border-l-2 border-border/60 ps-3"
+    >
+      {preview.data !== null ? (
+        <>
+          {preview.data.messages
+            .map((message, position) => ({ message, key: `${position}` }))
+            .map(({ message, key }) => (
+              <div key={key} className="text-xs leading-normal">
+                <span className="font-medium text-foreground">
+                  {message.role === "user" ? "You" : agent}
+                </span>
+                <p className="line-clamp-4 whitespace-pre-wrap text-muted-foreground">
+                  {message.text}
+                </p>
+              </div>
+            ))}
+          {preview.data.more ? (
+            <p className="text-xs text-muted-foreground">The conversation goes on from here.</p>
+          ) : null}
+        </>
+      ) : preview.failure !== null ? (
+        <p className="text-xs text-muted-foreground">
+          {"message" in preview.failure && typeof preview.failure.message === "string"
+            ? preview.failure.message
+            : "The conversation could not be read."}
+        </p>
+      ) : (
+        <p role="status" className="flex items-center gap-2 text-xs text-muted-foreground">
+          <Spinner aria-hidden size="xs" tone="muted" />
+          Reading the conversation
+        </p>
+      )}
+    </div>
+  );
+}
+
+/** Search by title or folder, and which tools' sessions to show. */
+function ExternalFilterBar(props: {
+  readonly search: string;
+  readonly sources: ReadonlyArray<AgentSessionSource>;
+  readonly onSearch: (search: string) => void;
+  readonly onSources: (sources: ReadonlyArray<AgentSessionSource>) => void;
+}) {
+  return (
+    <div className="flex flex-wrap items-center gap-3 px-3 sm:px-4">
+      <InputGroup className="min-w-48 flex-1">
+        <InputGroupAddon>
+          <SearchIcon aria-hidden className="size-3.5 text-muted-foreground" />
+        </InputGroupAddon>
+        <InputGroupInput
+          type="search"
+          size="sm"
+          value={props.search}
+          onChange={(event) => props.onSearch(event.target.value)}
+          placeholder="Search titles and folders"
+          aria-label="Search external sessions"
+          data-testid="external-sessions-search"
+          spellCheck={false}
+          autoComplete="off"
+        />
+      </InputGroup>
+      <ToggleGroup
+        aria-label="Tools"
+        variant="segmented"
+        value={[props.sources[0] ?? "all"]}
+        onValueChange={(next) => {
+          const value = next[0];
+          props.onSources(
+            value === "claudeAgent" || value === "codex" || value === "pi" ? [value] : [],
+          );
+        }}
+      >
+        <Toggle value="all">All</Toggle>
+        <Toggle value="claudeAgent">Claude Code</Toggle>
+        <Toggle value="codex">Codex</Toggle>
+        <Toggle value="pi">Pi</Toggle>
+      </ToggleGroup>
     </div>
   );
 }

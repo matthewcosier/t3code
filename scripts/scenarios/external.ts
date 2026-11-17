@@ -51,6 +51,10 @@ export const outsideProject = Effect.fn("external.outsideProject")(function* (ti
   return folder;
 });
 
+/** A transcript's records, one JSON object per line. */
+const jsonLines = (records: ReadonlyArray<object>) =>
+  records.map((record) => `${JSON.stringify(record)}\n`).join("");
+
 /**
  * A Claude home only these scenarios read, writing sessions as if run outside T3 Code in
  * `workspace`, each last active `ageDays` ago.
@@ -86,14 +90,21 @@ export const claudeSessions = Effect.fn("external.claudeSessions")(function* (wo
       },
     ];
     const file = path.join(folder, `${sessionId}.jsonl`);
-    yield* fs.writeFileString(
-      file,
-      records.map((record) => `${JSON.stringify(record)}\n`).join(""),
-    );
+    yield* fs.writeFileString(file, jsonLines(records));
     yield* fs.utimes(file, atMs / 1000, atMs / 1000);
     return file;
   });
-  return { home, write };
+  /** A session that named its folder but never got a message: nothing to open. */
+  const writeEmpty = Effect.fn("external.writeEmptySession")(function* (sessionId: string) {
+    const file = path.join(folder, `${sessionId}.jsonl`);
+    const timestamp = DateTime.formatIso(DateTime.makeUnsafe(yield* Clock.currentTimeMillis));
+    yield* fs.writeFileString(
+      file,
+      jsonLines([{ type: "system", cwd: workspace, sessionId, timestamp }]),
+    );
+    return file;
+  });
+  return { home, write, writeEmpty };
 });
 
 /** Turns external sessions on with one Claude profile over `claudeHome`, and puts settings back. */
