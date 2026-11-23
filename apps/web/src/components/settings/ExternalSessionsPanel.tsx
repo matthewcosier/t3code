@@ -111,7 +111,7 @@ import {
 } from "./externalSessions.logic";
 import { SettingsGroup } from "./SettingsGroup";
 import { SettingsPageContainer, SettingsRow, SettingsSection } from "./settingsLayout";
-import { searchableSetting } from "./settingsSearch";
+import { useSearchableSetting } from "./settingsSearch";
 
 const documentVisible = () => getDocumentActivity().visible;
 /** Groups the person opened or closed, by id; the rest follow the default. */
@@ -168,6 +168,7 @@ function ExternalSessions(props: { readonly environmentId: EnvironmentId }) {
   const { environmentId } = props;
   const enabled = useEnvironmentSettings(environmentId, (settings) => settings.externalSessions);
   const updateSettings = useUpdateEnvironmentSettings(environmentId);
+  const searchableSetting = useSearchableSetting();
   const showRow = (
     <SettingsRow
       {...searchableSetting("external-sessions")}
