@@ -174,7 +174,19 @@ const decodePiEntryLinks = Schema.decodeUnknownOption(
   }),
 );
 const selectTranscriptPath = createTranscriptJsonSelector(TranscriptRecord);
+// Only the fields extractCwd reads, so a cwd record carrying a large image stays small in memory.
+const selectCwdPath = createTranscriptJsonSelector(
+  Schema.Struct({
+    cwd: Schema.String,
+    type: Schema.String,
+    payload: Schema.Struct({
+      cwd: Schema.String,
+      source: Schema.Struct({ subagent: Schema.Null, subAgent: Schema.Null }),
+    }),
+  }),
+);
 const decodeCodexTurnMetadata = Schema.decodeUnknownOption(CodexTurnMetadata);
+const decodeJsonLine = Schema.decodeUnknownOption(Schema.fromJsonString(Schema.Unknown));
 export const decodeImportedTranscriptPayload = Schema.decodeUnknownOption(
   Schema.Struct({
     cwd: Schema.optional(Schema.String),
@@ -906,14 +918,8 @@ function isT3ManagedWorktree(
 
 // false stops metadata scanning for an excluded rollout, even if later records contain a cwd.
 /** The provider's session ID from one Claude record or Codex session_meta line, if it names one. */
-function extractNativeSessionId(line: string, source: AgentSessionSource): string | null {
+function extractNativeSessionId(parsed: unknown, source: AgentSessionSource): string | null {
   if (source === "pi") return null;
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(line);
-  } catch {
-    return null;
-  }
   if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) return null;
   const record = parsed as Record<string, unknown>;
   if (source === "claudeAgent") {
@@ -931,13 +937,7 @@ function extractNativeSessionId(line: string, source: AgentSessionSource): strin
   return null;
 }
 
-function extractCwd(line: string, source: AgentSessionSource): string | null | false {
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(line);
-  } catch {
-    return null;
-  }
+function extractCwd(parsed: unknown, source: AgentSessionSource): string | null | false {
   if (typeof parsed !== "object" || parsed === null) return null;
 
   const record = parsed as Record<string, unknown>;
@@ -1319,11 +1319,28 @@ export const make = Effect.gen(function* () {
             const size = isCompressedTranscript(transcript.filePath)
               ? Number.POSITIVE_INFINITY
               : transcript.identity.size;
-            const decoder = new TextDecoder();
-            let remaining = "";
             let bytesRead = 0;
             let recordsRead = 0;
-            const maxBytes = Math.min(MAX_TRANSCRIPT_SCAN_BYTES, size);
+            let selectedBytes = 0;
+            const reserveSelected = (bytes: number) => {
+              selectedBytes += bytes;
+              if (selectedBytes > MAX_TRANSCRIPT_SCAN_BYTES) {
+                throw new TranscriptJsonLimitError({
+                  message: "Transcript cwd fields exceed the scan limit",
+                });
+              }
+            };
+            // Claude writes cwd before message, so a record with a large image need not be read to its end.
+            let topLevelCwd: string | null = null;
+            const createReader = () =>
+              createTranscriptJsonReader(reserveSelected, selectCwdPath, {
+                onTopLevelString: (key, value) => {
+                  if (key === "cwd" && value.trim().length > 0) topLevelCwd ??= value;
+                },
+              });
+            let reader = createReader();
+            let decoder = new TextDecoder();
+            let recordStarted = false;
             const reserveRecord = () => {
               if (
                 recordsRead === MAX_METADATA_RECORDS_PER_TRANSCRIPT ||
@@ -1336,13 +1353,43 @@ export const make = Effect.gen(function* () {
               budget.recordsRemaining -= 1;
               return true;
             };
-            const readLastRecord = () => {
-              const record = remaining + decoder.decode();
-              return record.length === 0 || !reserveRecord()
-                ? null
-                : extractCwd(record.trim(), source);
+            const finishRecord = () => {
+              reader.write(decoder.decode());
+              const value = reader.finish();
+              reader = createReader();
+              decoder = new TextDecoder();
+              recordStarted = false;
+              selectedBytes = 0;
+              return extractCwd(value, source);
             };
+            const scanChunk = (chunk: Uint8Array): string | false | null | undefined => {
+              let start = 0;
+              while (start < chunk.byteLength) {
+                const newline = chunk.indexOf(10, start);
+                const end = newline === -1 ? chunk.byteLength : newline;
+                if (end > start) {
+                  recordStarted = true;
+                  reader.write(decoder.decode(chunk.subarray(start, end), { stream: true }));
+                  if (topLevelCwd !== null) return reserveRecord() ? topLevelCwd : null;
+                }
+                if (newline === -1) return undefined;
+                if (!reserveRecord()) return null;
+                const cwd = finishRecord();
+                if (cwd !== null) return cwd;
+                start = newline + 1;
+              }
+              return undefined;
+            };
+            const parse = <A>(f: () => A) =>
+              Effect.try({
+                try: f,
+                catch: (cause) =>
+                  new TranscriptParseError({ filePath: transcript.filePath, cause }),
+              });
+            const readLastRecord = () =>
+              !recordStarted || !reserveRecord() ? null : finishRecord();
 
+            const maxBytes = Math.min(MAX_TRANSCRIPT_SCAN_BYTES, size);
             while (bytesRead < maxBytes) {
               if (budget.bytesRemaining === 0 || budget.operationsRemaining === 0) {
                 budget.truncated = true;
@@ -1357,26 +1404,19 @@ export const make = Effect.gen(function* () {
               budget.bytesRemaining -= readSize;
               const next = yield* readChunk(readSize);
               if (Option.isNone(next)) {
-                return readLastRecord();
+                return yield* parse(readLastRecord);
               }
 
               bytesRead += next.value.byteLength;
-              remaining += decoder.decode(next.value, { stream: true });
-              const lines = remaining.split("\n");
-              remaining = lines.pop() ?? "";
-
-              for (const line of lines) {
-                if (!reserveRecord()) return null;
-                const cwd = extractCwd(line.trim(), source);
-                if (cwd !== null) return cwd;
-              }
+              const result = yield* parse(() => scanChunk(next.value));
+              if (result !== undefined) return result;
             }
 
             if (bytesRead < size) {
               budget.truncated = true;
               return null;
             }
-            return readLastRecord();
+            return yield* parse(readLastRecord);
           }),
         ),
       ),
@@ -2530,12 +2570,14 @@ export const make = Effect.gen(function* () {
     let cwd: string | null = null;
     let nativeSessionId: string | null = null;
     for (const line of contents.split("\n")) {
+      const parsed = decodeJsonLine(line);
+      if (Option.isNone(parsed)) continue;
       if (cwd === null) {
-        const found = extractCwd(line, file.source);
+        const found = extractCwd(parsed.value, file.source);
         if (found === false) return Option.none<AgentSessionCatalogMetadata>();
         if (found !== null) cwd = projectCwd(found, file.projectRoots);
       }
-      nativeSessionId ??= extractNativeSessionId(line, file.source);
+      nativeSessionId ??= extractNativeSessionId(parsed.value, file.source);
       if (cwd !== null && nativeSessionId !== null) break;
     }
     const fallbackSessionId = path.basename(
