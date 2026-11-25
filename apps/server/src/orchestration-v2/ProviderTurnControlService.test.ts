@@ -33,6 +33,17 @@ import * as ProviderSessionManager from "./ProviderSessionManager.ts";
 import * as ProviderTurnControlService from "./ProviderTurnControlService.ts";
 import * as RuntimePolicy from "./RuntimePolicy.ts";
 
+/** Resolves each thread's own modes and worktree, as the removed RuntimePolicy pass-through did. */
+const runtimePolicyFromThread = Layer.succeed(RuntimePolicy.RuntimePolicyV2, {
+  resolve: Effect.fn("RuntimePolicyV2.resolve")(function (input) {
+    return Effect.succeed({
+      runtimeMode: input.thread.runtimeMode,
+      interactionMode: input.thread.interactionMode,
+      cwd: input.thread.worktreePath,
+    });
+  }),
+});
+
 const driver = ProviderDriverKind.make("codex");
 const providerInstanceId = ProviderInstanceId.make("codex");
 const modelSelection = {
@@ -333,7 +344,7 @@ it.effect(
             layerSessionManager,
             Layer.mock(EventSink.EventSinkV2)({}),
             McpAppModelContext.layerEmpty,
-            RuntimePolicy.layer,
+            runtimePolicyFromThread,
           ),
         ),
       );
@@ -433,7 +444,7 @@ it.effect("steers a running turn with its sender and the thread's MCP app model 
             }),
           ),
           layerSessions(sessionId, runtime),
-          RuntimePolicy.layer,
+          runtimePolicyFromThread,
           Layer.mock(EventSink.EventSinkV2)({}),
           Layer.mock(McpAppModelContext.McpAppModelContext)({
             forThread: () =>
@@ -524,7 +535,7 @@ it.effect("applies the thread's current mode to its live session without a messa
       const control = yield* ProviderTurnControlService.ProviderTurnControlServiceV2;
       yield* control.applyRuntimePolicy({ threadId });
     });
-    yield* apply.pipe(Effect.provide(layerControl(RuntimePolicy.layer)));
+    yield* apply.pipe(Effect.provide(layerControl(runtimePolicyFromThread)));
     assert.deepEqual(applied, [
       { runtimeMode: "full-access", interactionMode: "default", cwd: "/workspace" },
     ]);

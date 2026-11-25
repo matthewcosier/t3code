@@ -33,6 +33,17 @@ import * as ProviderTurnControlService from "./ProviderTurnControlService.ts";
 import * as RuntimePolicy from "./RuntimePolicy.ts";
 import * as RuntimeRequestService from "./RuntimeRequestService.ts";
 
+/** Resolves each thread's own modes and worktree, as the removed RuntimePolicy pass-through did. */
+const runtimePolicyFromThread = Layer.succeed(RuntimePolicy.RuntimePolicyV2, {
+  resolve: Effect.fn("RuntimePolicyV2.resolve")(function (input) {
+    return Effect.succeed({
+      runtimeMode: input.thread.runtimeMode,
+      interactionMode: input.thread.interactionMode,
+      cwd: input.thread.worktreePath,
+    });
+  }),
+});
+
 const threadId = ThreadId.make("thread:control-reads");
 const providerThreadId = ProviderThreadId.make("provider-thread:control-reads");
 const providerTurnId = ProviderTurnId.make("provider-turn:control-reads");
@@ -400,7 +411,7 @@ it.effect.each(storageCases)(
                 layerSessions,
                 layerEvents,
                 McpAppModelContext.layerEmpty,
-                RuntimePolicy.layer,
+                runtimePolicyFromThread,
               ),
             ),
           ),
