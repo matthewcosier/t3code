@@ -1,5 +1,5 @@
 import { assert, describe, it } from "@effect/vitest";
-import { CommandId, EventId, ProjectId, type ProjectScript } from "@t3tools/contracts";
+import { CommandId, EventId, ProjectId, type ProjectScript, ThreadId } from "@t3tools/contracts";
 import * as DateTime from "effect/DateTime";
 import * as Result from "effect/Result";
 
@@ -205,5 +205,66 @@ describe("planProjectCommand", () => {
         );
       }
     }
+  });
+
+  it("sets, replaces, clears, and preserves ownerThreadId on project.meta.update", () => {
+    const ownerA = ThreadId.make("thread:owner-a");
+    const ownerB = ThreadId.make("thread:owner-b");
+    assert.deepInclude(
+      payloadOf(
+        plan(
+          {
+            type: "project.meta.update",
+            commandId: CommandId.make("cmd-owner-set"),
+            projectId,
+            ownerThreadId: ownerA,
+          },
+          { project: row() },
+        ),
+      ),
+      { ownerThreadId: ownerA },
+    );
+    assert.deepInclude(
+      payloadOf(
+        plan(
+          {
+            type: "project.meta.update",
+            commandId: CommandId.make("cmd-owner-replace"),
+            projectId,
+            ownerThreadId: ownerB,
+          },
+          { project: row({ ownerThreadId: ownerA }) },
+        ),
+      ),
+      { ownerThreadId: ownerB },
+    );
+    assert.deepInclude(
+      payloadOf(
+        plan(
+          {
+            type: "project.meta.update",
+            commandId: CommandId.make("cmd-owner-clear"),
+            projectId,
+            ownerThreadId: null,
+          },
+          { project: row({ ownerThreadId: ownerB }) },
+        ),
+      ),
+      { ownerThreadId: null },
+    );
+    assert.notProperty(
+      payloadOf(
+        plan(
+          {
+            type: "project.meta.update",
+            commandId: CommandId.make("cmd-owner-untouched"),
+            projectId,
+            title: "Renamed",
+          },
+          { project: row({ ownerThreadId: ownerB }) },
+        ),
+      ),
+      "ownerThreadId",
+    );
   });
 });

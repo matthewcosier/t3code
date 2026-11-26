@@ -194,6 +194,7 @@ export const Project = Schema.Struct({
   trackedFolders: Schema.optional(ProjectTrackedFolders),
   pinnedAt: Schema.optional(Schema.NullOr(IsoDateTime)),
   archivedAt: Schema.optional(Schema.NullOr(IsoDateTime)),
+  ownerThreadId: Schema.optional(Schema.NullOr(ThreadId)),
   createdAt: IsoDateTime,
   updatedAt: IsoDateTime,
   deletedAt: Schema.NullOr(IsoDateTime),
@@ -254,6 +255,8 @@ export const ProjectMutation = Schema.Union([
     // Applied to the list as the server has it, so two clients' edits do not undo each other.
     trackFolders: Schema.optional(ProjectAddedFolders),
     untrackFolders: Schema.optional(Schema.Array(TrimmedNonEmptyString)),
+    // Human-only: omitted from ProjectUpdatePayload so MCP tools cannot claim project ownership.
+    ownerThreadId: Schema.optional(Schema.NullOr(ThreadId)),
   }),
   Schema.Struct({
     type: Schema.Literal("project.delete"),

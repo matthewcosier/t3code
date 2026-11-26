@@ -1,6 +1,11 @@
 import { thrownErrorMessage } from "@t3tools/client-runtime/errors";
-import { scopeProjectRef } from "@t3tools/client-runtime/environment";
+import { scopeProjectRef, scopeThreadRef } from "@t3tools/client-runtime/environment";
+import {
+  isThreadEligibleProjectOwner,
+  recentProjectsForOwnerMenu,
+} from "@t3tools/client-runtime/state/project-owner";
 import { requestCustomSnooze } from "../components/CustomSnoozeDialog";
+import { requestProjectOwnerPicker } from "../components/projectOwnerPickerState";
 import { openGuestShareDialog } from "../components/chat/guestShareDialogState";
 import {
   type AtomCommandResult,
@@ -11,6 +16,7 @@ import {
 import { canSnooze, effectiveSnoozed } from "@t3tools/client-runtime/state/thread-settled";
 import {
   AuthOrchestrationOperateScope,
+  ProjectId,
   type ScopedThreadRef,
   type ThreadId,
   type ContextMenuSource,
@@ -36,7 +42,9 @@ import { readEnvironmentScope } from "../state/session";
 import {
   readEnvironmentServerConfigLoaded,
   readEnvironmentSupportsAutoSettleOptOut,
+  readProjects,
   readThreadShell,
+  readThreadShells,
   useProjects,
 } from "../state/entities";
 import { usePrimaryEnvironmentId } from "../state/environments";
@@ -94,6 +102,8 @@ export function useThreadActionMenu(input: {
     deleteThread,
     markThreadUnread,
     turnThreadIntoProject,
+    setProjectOwner,
+    detachThreadFromOwner,
   } = useThreadActions();
   const regenerateThreadTitle = useOrchestrationCommand(threadEnvironment.regenerateTitle, {
     reportFailure: false,
@@ -133,6 +143,26 @@ export function useThreadActionMenu(input: {
     };
     const isRegeneratingTitle = thread.titleRegeneration != null;
     const snoozePresets = resolveSnoozePresets(now, timestampFormat, threadRef.environmentId);
+    const allProjects = readProjects();
+    const allThreads = readThreadShells();
+    const eligibleOwner = isThreadEligibleProjectOwner({
+      archivedAt: thread.archivedAt,
+      settledOverride: thread.settledOverride,
+      isDelegated:
+        thread.lineage.relationshipToParent === "subagent" || thread.delegatedFrom != null,
+    });
+    const recentOwnerProjects = eligibleOwner
+      ? recentProjectsForOwnerMenu({
+          projects: allProjects,
+          threads: allThreads,
+          environmentId: threadRef.environmentId,
+        }).recent
+      : [];
+    const managedByOwnerTitle =
+      thread.managedByThreadId != null
+        ? (readThreadShell(scopeThreadRef(threadRef.environmentId, thread.managedByThreadId))
+            ?.title ?? m(msg("owner")))
+        : null;
     const items = buildThreadActionMenuItems({
       canOperate: readEnvironmentScope(threadRef.environmentId, AuthOrchestrationOperateScope),
       canTriage: threadTriagePermitted(threadRef.environmentId),
@@ -152,6 +182,17 @@ export function useThreadActionMenu(input: {
       snoozePresets,
       canShareWithGuest,
       canTurnIntoProject: canTurnThreadIntoProject(threadRef),
+      projectOwnerMenu:
+        recentOwnerProjects.length > 0
+          ? {
+              projects: recentOwnerProjects.map((project) => ({
+                id: project.id,
+                label: project.title,
+                isOwner: project.ownerThreadId === thread.id,
+              })),
+            }
+          : null,
+      managedByOwnerTitle,
     });
     const run = async (action: ThreadActionMenuId) => {
       const api = readLocalApi();
@@ -166,6 +207,38 @@ export function useThreadActionMenu(input: {
           m(msg("Thread action unavailable")),
           new Error(m(msg("This connection cannot change threads."))),
         );
+        return;
+      }
+      if (action.startsWith("set-project-owner:")) {
+        const suffix = action.slice("set-project-owner:".length);
+        if (suffix === "more") {
+          await requestProjectOwnerPicker({
+            environmentId: threadRef.environmentId,
+            threadId: thread.id,
+            threadTitle: thread.title,
+          });
+          return;
+        }
+        const projectId = ProjectId.make(suffix);
+        const currentProject = readProjects().find(
+          (candidate) =>
+            candidate.environmentId === threadRef.environmentId && candidate.id === projectId,
+        );
+        const nextOwner = currentProject?.ownerThreadId === thread.id ? null : thread.id;
+        const result = await setProjectOwner(
+          scopeProjectRef(threadRef.environmentId, projectId),
+          nextOwner,
+        );
+        if (result._tag === "Failure" && !isAtomCommandInterrupted(result)) {
+          failureToast(m(msg("Failed to update project owner")), squashAtomCommandFailure(result));
+        }
+        return;
+      }
+      if (action === "detach-owner") {
+        const result = await detachThreadFromOwner(threadRef);
+        if (result._tag === "Failure" && !isAtomCommandInterrupted(result)) {
+          failureToast(m(msg("Failed to detach from owner")), squashAtomCommandFailure(result));
+        }
         return;
       }
       if (action.startsWith("snooze:")) {

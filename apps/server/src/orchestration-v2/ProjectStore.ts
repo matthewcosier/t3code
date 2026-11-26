@@ -8,6 +8,7 @@ import {
   ProjectScript,
   ProjectTrackedFolders,
   ThreadEnvMode,
+  ThreadId,
 } from "@t3tools/contracts";
 import * as Context from "effect/Context";
 import * as NodeSqliteClient from "@t3tools/shared/nodeSqliteClient";
@@ -44,6 +45,7 @@ export const ProjectRow = Schema.Struct({
   trackedFolders: ProjectTrackedFolders,
   pinnedAt: Schema.NullOr(IsoDateTime),
   archivedAt: Schema.NullOr(IsoDateTime),
+  ownerThreadId: Schema.optional(Schema.NullOr(ThreadId)),
   createdAt: IsoDateTime,
   updatedAt: IsoDateTime,
   deletedAt: Schema.NullOr(IsoDateTime),
@@ -52,6 +54,7 @@ export type ProjectRow = typeof ProjectRow.Type;
 
 const ProjectDbRow = Schema.Struct({
   ...ProjectRow.fields,
+  ownerThreadId: Schema.NullOr(ThreadId),
   defaultModelSelection: Schema.NullOr(Schema.fromJsonString(ModelSelection)),
   hasCustomTitle: Schema.BooleanFromBit,
   autoPull: Schema.BooleanFromBit,
@@ -76,6 +79,7 @@ function toShell(row: ProjectRow): OrchestrationProjectShell {
     trackedFolders: row.trackedFolders,
     pinnedAt: row.pinnedAt,
     archivedAt: row.archivedAt,
+    ownerThreadId: row.ownerThreadId ?? null,
     createdAt: row.createdAt,
     updatedAt: row.updatedAt,
   };
@@ -98,6 +102,9 @@ export class ProjectStoreV2 extends Context.Service<
     readonly findActiveByWorkspaceRoot: (
       workspaceRoot: string,
     ) => Effect.Effect<Option.Option<ProjectRow>, ProjectStoreV2Error>;
+    readonly listByOwnerThreadId: (
+      ownerThreadId: ThreadId,
+    ) => Effect.Effect<ReadonlyArray<ProjectRow>, ProjectStoreV2Error>;
     readonly getShell: (
       projectId: ProjectId,
     ) => Effect.Effect<Option.Option<OrchestrationProjectShell>, ProjectStoreV2Error>;
@@ -117,6 +124,7 @@ export const make = Effect.gen(function* () {
       projectId: Schema.optional(ProjectId),
       projectIds: Schema.optional(Schema.Array(ProjectId)),
       workspaceRoot: Schema.optional(Schema.String),
+      ownerThreadId: Schema.optional(ThreadId),
       includeDeleted: Schema.Boolean,
     }),
     Result: ProjectDbRow,
@@ -135,6 +143,7 @@ export const make = Effect.gen(function* () {
         tracked_folders_json AS "trackedFolders",
         pinned_at AS "pinnedAt",
         archived_at AS "archivedAt",
+        owner_thread_id AS "ownerThreadId",
         created_at AS "createdAt",
         updated_at AS "updatedAt",
         deleted_at AS "deletedAt"
@@ -146,13 +155,16 @@ export const make = Effect.gen(function* () {
         ...(request.workspaceRoot === undefined
           ? []
           : [sql`workspace_root = ${request.workspaceRoot}`]),
+        ...(request.ownerThreadId === undefined
+          ? []
+          : [sql`owner_thread_id = ${request.ownerThreadId}`]),
       ])}
       ORDER BY created_at ASC, project_id ASC
     `,
   });
 
   const upsertRow = (row: ProjectRow) =>
-    encodeRow(row).pipe(
+    encodeRow({ ...row, ownerThreadId: row.ownerThreadId ?? null }).pipe(
       Effect.flatMap(
         (encoded) => sql`
           INSERT INTO projection_projects (
@@ -169,6 +181,7 @@ export const make = Effect.gen(function* () {
             tracked_folders_json,
             pinned_at,
             archived_at,
+            owner_thread_id,
             created_at,
             updated_at,
             deleted_at
@@ -187,6 +200,7 @@ export const make = Effect.gen(function* () {
             ${encoded.trackedFolders},
             ${encoded.pinnedAt},
             ${encoded.archivedAt},
+            ${encoded.ownerThreadId},
             ${encoded.createdAt},
             ${encoded.updatedAt},
             ${encoded.deletedAt}
@@ -209,6 +223,7 @@ export const make = Effect.gen(function* () {
             tracked_folders_json = excluded.tracked_folders_json,
             pinned_at = excluded.pinned_at,
             archived_at = excluded.archived_at,
+            owner_thread_id = excluded.owner_thread_id,
             created_at = excluded.created_at,
             updated_at = excluded.updated_at,
             deleted_at = excluded.deleted_at
@@ -243,6 +258,12 @@ export const make = Effect.gen(function* () {
       mapError("findActiveByWorkspaceRoot"),
     );
 
+  const listByOwnerThreadId: ProjectStoreV2["Service"]["listByOwnerThreadId"] = (ownerThreadId) =>
+    selectRows({ ownerThreadId, includeDeleted: false }).pipe(
+      NodeSqliteClient.readOnly,
+      mapError("listByOwnerThreadId"),
+    );
+
   const apply: ProjectStoreV2["Service"]["apply"] = Effect.fn("ProjectStoreV2.apply")(
     function* (event) {
       if (event.type === "project.created") {
@@ -261,6 +282,7 @@ export const make = Effect.gen(function* () {
           trackedFolders: payload.trackedFolders ?? [],
           pinnedAt: null,
           archivedAt: null,
+          ownerThreadId: null,
           createdAt: payload.createdAt,
           updatedAt: payload.updatedAt,
           deletedAt: null,
@@ -294,6 +316,7 @@ export const make = Effect.gen(function* () {
         ...(payload.trackedFolders === undefined ? {} : { trackedFolders: payload.trackedFolders }),
         ...(payload.pinnedAt === undefined ? {} : { pinnedAt: payload.pinnedAt }),
         ...(payload.archivedAt === undefined ? {} : { archivedAt: payload.archivedAt }),
+        ...(payload.ownerThreadId === undefined ? {} : { ownerThreadId: payload.ownerThreadId }),
         updatedAt: payload.updatedAt,
       }).pipe(mapError("apply"));
     },
@@ -304,6 +327,7 @@ export const make = Effect.gen(function* () {
     get,
     list,
     findActiveByWorkspaceRoot,
+    listByOwnerThreadId,
     getShell: Effect.fn("ProjectStoreV2.getShell")(function (projectId) {
       return get(projectId).pipe(Effect.map(Option.map(toShell)));
     }),

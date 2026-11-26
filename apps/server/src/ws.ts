@@ -2079,11 +2079,22 @@ export const layerWsRpc = (
                   (command.type === "prepared-run.retry"
                     ? threadLaunch.retryPreparation(command)
                     : ThreadMessageIntake.dispatchCommand(
-                        ThreadManagementService.withCreationProvenance(command, {
-                          createdBy: "user",
-                          creationSource:
-                            "creationSource" in command ? command.creationSource : "web",
-                        }),
+                        ThreadManagementService.withCreationProvenance(
+                          // Clients may detach a managed thread (null), never assign an owner directly.
+                          command.type === "thread.create" &&
+                            command.managedByThreadId !== undefined
+                            ? { ...command, managedByThreadId: undefined }
+                            : command.type === "thread.metadata.update" &&
+                                command.managedByThreadId !== undefined &&
+                                command.managedByThreadId !== null
+                              ? { ...command, managedByThreadId: undefined }
+                              : command,
+                          {
+                            createdBy: "user",
+                            creationSource:
+                              "creationSource" in command ? command.creationSource : "web",
+                          },
+                        ),
                         {
                           managesProviders:
                             currentSession.scopes.includes(AuthProvidersManageScope),
@@ -2277,6 +2288,9 @@ export const layerWsRpc = (
                           runtimeMode: input.runtimeMode,
                           interactionMode: input.interactionMode,
                           workspaceStrategy: input.workspaceStrategy,
+                          ...(input.skipOwnerEnrolment === undefined
+                            ? {}
+                            : { skipOwnerEnrolment: input.skipOwnerEnrolment }),
                           ...(input.initialMessage === undefined
                             ? {}
                             : {

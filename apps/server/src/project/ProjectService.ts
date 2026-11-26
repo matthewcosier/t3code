@@ -1,5 +1,6 @@
 import {
   CommandId,
+  isDelegatedAppThread,
   type OrchestrationProjectShell,
   PROJECT_TRACKED_FOLDERS_MAX,
   ProjectId,
@@ -65,6 +66,7 @@ export interface ProjectUpdateInput extends ProjectUpdatePayload {
   /** Added to, and removed by path from, the list the project has when the update commits. */
   readonly trackFolders?: ReadonlyArray<ProjectTrackedFolder> | undefined;
   readonly untrackFolders?: ReadonlyArray<string> | undefined;
+  readonly ownerThreadId?: ThreadId | null | undefined;
 }
 
 export interface ProjectBootstrapInput extends ProjectCreateInput {}
@@ -229,6 +231,7 @@ export const make = Effect.gen(function* () {
     trackedFolders: row.trackedFolders,
     pinnedAt: row.pinnedAt,
     archivedAt: row.archivedAt,
+    ownerThreadId: row.ownerThreadId ?? null,
     createdAt: row.createdAt,
     updatedAt: row.updatedAt,
     deletedAt: row.deletedAt,
@@ -635,6 +638,23 @@ export const make = Effect.gen(function* () {
       if (workspaceRoot !== previousRoot) {
         yield* rejectWorktreeContainer(input.projectId, workspaceRoot);
       }
+      if (input.ownerThreadId !== undefined && input.ownerThreadId !== null) {
+        const candidateOwner = yield* threadProjections
+          .getThread(input.ownerThreadId)
+          .pipe(Effect.option);
+        if (
+          Option.isNone(candidateOwner) ||
+          candidateOwner.value.deletedAt !== null ||
+          candidateOwner.value.archivedAt !== null ||
+          candidateOwner.value.settledOverride === "settled" ||
+          isDelegatedAppThread(candidateOwner.value)
+        ) {
+          return yield* new ProjectInvalidError({
+            projectId: input.projectId,
+            detail: "Project owner must be an active, non-delegated thread.",
+          });
+        }
+      }
       const command = {
         type: "project.meta.update",
         commandId: input.commandId,
@@ -653,6 +673,7 @@ export const make = Effect.gen(function* () {
         ...(input.scripts === undefined ? {} : { scripts: input.scripts }),
         ...(input.pinned === undefined ? {} : { pinned: input.pinned }),
         ...(input.archived === undefined ? {} : { archived: input.archived }),
+        ...(input.ownerThreadId === undefined ? {} : { ownerThreadId: input.ownerThreadId }),
       } as const;
       // Checked against the row under the lock: an update that ran meanwhile may have moved the
       // project's folder or changed what it tracks.

@@ -9,6 +9,7 @@ import {
   NonNegativeInt,
   ProjectId,
   ProviderItemId,
+  ThreadId,
   TrimmedNonEmptyString,
 } from "./baseSchemas.ts";
 import { RepositoryIdentity, ThreadEnvMode } from "./environment.ts";
@@ -64,6 +65,7 @@ export const ApplicationProjectMetaUpdatedPayload = Schema.Struct({
   trackedFolders: Schema.optional(ProjectTrackedFolders),
   pinnedAt: Schema.optional(Schema.NullOr(IsoDateTime)),
   archivedAt: Schema.optional(Schema.NullOr(IsoDateTime)),
+  ownerThreadId: Schema.optional(Schema.NullOr(ThreadId)),
   updatedAt: IsoDateTime,
 });
 export type ApplicationProjectMetaUpdatedPayload = typeof ApplicationProjectMetaUpdatedPayload.Type;

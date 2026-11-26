@@ -7,11 +7,14 @@ import * as NodeCrypto from "@effect/platform-node/NodeCrypto";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import {
   CommandId,
+  EventId,
   type Project,
   ProjectId,
   type ProjectTrackedFolder,
   ProviderInstanceId,
+  ThreadId,
 } from "@t3tools/contracts";
+import * as DateTime from "effect/DateTime";
 import * as HostProcess from "@t3tools/shared/HostProcess";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
@@ -1231,5 +1234,111 @@ it.effect("rejects an update that waited on the lock while its project was delet
       Option.getOrThrow(yield* service.getById(projectId, { includeDeleted: true })).title,
       "Update race",
     );
+  }).pipe(Effect.provide(layerProjectServiceDependencies)),
+);
+
+it.effect("accepts only active, unsettled, non-delegated threads as project owner", () =>
+  Effect.gen(function* () {
+    const service = yield* ProjectService.make;
+    const eventSink = yield* EventSink.EventSinkV2;
+    const projectId = ProjectId.make("project:owner-validation");
+    yield* service.create({
+      commandId: CommandId.make("command:owner-validation:create"),
+      projectId,
+      title: "Owner validation",
+      workspaceRoot: "/work/owner-validation",
+    });
+
+    const now = DateTime.makeUnsafe("2026-11-26T00:00:00.000Z");
+    const providerInstanceId = ProviderInstanceId.make("codex");
+    const createThread = (
+      id: ThreadId,
+      overrides: {
+        readonly archivedAt?: DateTime.Utc | null;
+        readonly settledOverride?: "settled" | "active" | null;
+        readonly settledAt?: DateTime.Utc | null;
+        readonly delegated?: boolean;
+      } = {},
+    ) =>
+      eventSink.write({
+        events: [
+          {
+            id: EventId.make(`evt:create:${id}`),
+            type: "thread.created",
+            threadId: id,
+            providerInstanceId,
+            occurredAt: now,
+            payload: {
+              id,
+              projectId,
+              title: id,
+              providerInstanceId,
+              modelSelection: { instanceId: providerInstanceId, model: "gpt-5" },
+              runtimeMode: "full-access",
+              interactionMode: "default",
+              branch: null,
+              worktreePath: null,
+              activeProviderThreadId: null,
+              createdBy: "user",
+              creationSource: "web",
+              lineage: overrides.delegated
+                ? {
+                    parentThreadId: ThreadId.make("thread:parent"),
+                    rootThreadId: ThreadId.make("thread:parent"),
+                    relationshipToParent: "subagent",
+                  }
+                : {
+                    parentThreadId: null,
+                    rootThreadId: id,
+                    relationshipToParent: null,
+                  },
+              forkedFrom: null,
+              createdAt: now,
+              updatedAt: now,
+              archivedAt: overrides.archivedAt ?? null,
+              deletedAt: null,
+              settledAt: overrides.settledAt ?? null,
+              settledOverride: overrides.settledOverride ?? null,
+              lastVisitedAt: null,
+            },
+          },
+        ],
+      });
+
+    const activeId = ThreadId.make("thread:owner-active");
+    const archivedId = ThreadId.make("thread:owner-archived");
+    const settledId = ThreadId.make("thread:owner-settled");
+    const delegatedId = ThreadId.make("thread:owner-delegated");
+    const missingId = ThreadId.make("thread:owner-missing");
+
+    yield* createThread(activeId);
+    yield* createThread(archivedId, { archivedAt: now });
+    yield* createThread(settledId, { settledAt: now, settledOverride: "settled" });
+    yield* createThread(delegatedId, { delegated: true });
+
+    for (const invalidId of [archivedId, settledId, delegatedId, missingId]) {
+      const error = yield* service
+        .update({
+          commandId: CommandId.make(`command:owner-invalid:${invalidId}`),
+          projectId,
+          ownerThreadId: invalidId,
+        })
+        .pipe(Effect.flip);
+      assert.instanceOf(error, ProjectService.ProjectInvalidError);
+    }
+
+    const updated = yield* service.update({
+      commandId: CommandId.make("command:owner-valid"),
+      projectId,
+      ownerThreadId: activeId,
+    });
+    assert.strictEqual(updated.ownerThreadId, activeId);
+
+    const cleared = yield* service.update({
+      commandId: CommandId.make("command:owner-clear"),
+      projectId,
+      ownerThreadId: null,
+    });
+    assert.strictEqual(cleared.ownerThreadId, null);
   }).pipe(Effect.provide(layerProjectServiceDependencies)),
 );

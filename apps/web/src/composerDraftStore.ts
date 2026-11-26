@@ -422,6 +422,7 @@ const PersistedDraftThreadState = Schema.Struct({
     Schema.Struct({ url: Schema.String, branch: Schema.String }),
   ),
   worktreeRepositories: Schema.optionalKey(Schema.Array(Schema.String)),
+  skipOwnerEnrolment: Schema.optionalKey(Schema.Boolean),
   promotedTo: Schema.optionalKey(
     Schema.NullOr(
       Schema.Struct({
@@ -527,6 +528,8 @@ export interface DraftSessionState {
    * until the user chooses, which leaves the choice to the server's default.
    */
   worktreeRepositories?: ReadonlyArray<string>;
+  /** Opts this draft out of automatic enrolment under its project's owner thread. */
+  skipOwnerEnrolment?: boolean;
   promotedTo?: ScopedThreadRef | null;
 }
 
@@ -637,6 +640,7 @@ interface ComposerDraftStoreState {
       loadBalancedEnvironmentId?: EnvironmentId | null;
       checkoutPullRequest?: DraftCheckoutPullRequest | null;
       worktreeRepositories?: ReadonlyArray<string> | null;
+      skipOwnerEnrolment?: boolean;
     },
   ) => void;
   clearProjectDraftThreadId: (projectRef: ScopedProjectRef) => void;
@@ -3102,6 +3106,12 @@ const composerDraftStore = create<ComposerDraftStoreState>()(
                   ? undefined
                   : existing.worktreeRepositories
                 : (options.worktreeRepositories ?? undefined);
+            const skipOwnerEnrolment =
+              options.skipOwnerEnrolment === undefined
+                ? projectChanged
+                  ? undefined
+                  : existing.skipOwnerEnrolment
+                : options.skipOwnerEnrolment || undefined;
             const nextDraftThread: DraftThreadState = {
               threadId: existing.threadId,
               environmentId: nextProjectRef.environmentId,
@@ -3130,6 +3140,7 @@ const composerDraftStore = create<ComposerDraftStoreState>()(
                 : {}),
               ...(checkoutPullRequest ? { checkoutPullRequest } : {}),
               ...(worktreeRepositories ? { worktreeRepositories } : {}),
+              ...(skipOwnerEnrolment ? { skipOwnerEnrolment: true } : {}),
               promotedTo: existing.promotedTo ?? null,
             };
             const isUnchanged =
@@ -3146,6 +3157,7 @@ const composerDraftStore = create<ComposerDraftStoreState>()(
               nextDraftThread.envMode === existing.envMode &&
               nextDraftThread.startFromOrigin === existing.startFromOrigin &&
               nextDraftThread.workspaceExplicit === existing.workspaceExplicit &&
+              nextDraftThread.skipOwnerEnrolment === existing.skipOwnerEnrolment &&
               checkoutPullRequestsEqual(
                 nextDraftThread.checkoutPullRequest,
                 existing.checkoutPullRequest,
