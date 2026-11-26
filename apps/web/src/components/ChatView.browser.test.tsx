@@ -4,6 +4,7 @@ import {
   EnvironmentId,
   IssueTrackerKind,
   ORCHESTRATION_V2_WS_METHODS,
+  ProviderInstanceId,
   RunId,
   ThreadId,
   WS_METHODS,
@@ -19,6 +20,7 @@ import {
 import type * as Context from "effect/Context";
 import * as Schema from "effect/Schema";
 import * as Effect from "effect/Effect";
+import * as Stream from "effect/Stream";
 import { expect, it, vi } from "vite-plus/test";
 import { cdp, page, userEvent } from "vite-plus/test/browser";
 
@@ -36,7 +38,7 @@ import { usePromptStashStore } from "~/promptStashStore";
 import { useRightPanelStore } from "~/rightPanelStore";
 import { getRouter } from "~/router";
 import { appAtomRegistry } from "~/rpc/atomRegistry";
-import { environmentThreadDetails } from "~/state/threads";
+import { environmentThreadDetails, environmentThreadShells } from "~/state/threads";
 import {
   ENVIRONMENT_ID,
   PROJECT_ID,
@@ -44,6 +46,7 @@ import {
   answerRpc,
   assistantItem,
   dispatchedCommands,
+  emitShellThread,
   emitThreadEvent,
   hasPendingAssetUrl,
   installFakeEnvironment,
@@ -51,6 +54,7 @@ import {
   threadWithHistory,
   threadWithQuestion,
   type FakeDriver,
+  type FakeThread,
 } from "../../test/fakeEnvironment";
 import { act, fakeTimers, render } from "../../test/render";
 
@@ -876,6 +880,172 @@ it("a draft permission mode stored without its base is ignored on a server threa
     "Full access",
   );
   expect(sent).toEqual([]);
+});
+
+const CODEX_INSTANCE = ProviderInstanceId.make("codex");
+const CLAUDE_SELECTION = {
+  instanceId: ProviderInstanceId.make("claudeAgent"),
+  model: "claude-opus-4-6",
+};
+const HELD_SUPERVISED = { runtimeMode: "approval-required", runtimeModeBase: "auto" };
+const NOTHING_HELD = { runtimeMode: null, runtimeModeBase: null };
+
+/** `thread` with its latest run still running in its detail. */
+function withLatestRunRunning(thread: FakeThread): FakeThread {
+  return {
+    ...thread,
+    runs: thread.runs.map((run, index) =>
+      index === thread.runs.length - 1 ? { ...run, status: "running", completedAt: null } : run,
+    ),
+  };
+}
+
+/**
+ * Opens the thread on auto, a mode the composer offers in its overflow menu at this viewport,
+ * moves the shell stream on to `liveShell` if given, runs `beforePick`, picks Supervised and
+ * waits for the modes sent and the pick held to equal `expected`.
+ */
+async function pickSupervised(
+  fixture: FakeThread,
+  options: {
+    readonly liveShell?: FakeThread["shell"];
+    readonly withoutDetail?: true;
+    readonly beforePick?: () => Promise<void>;
+  },
+  expected: {
+    readonly sent: ReadonlyArray<string>;
+    readonly held: { readonly runtimeMode: string | null; readonly runtimeModeBase: string | null };
+  },
+) {
+  const thread: FakeThread = { ...fixture, runtimeMode: "auto" };
+  const threadRef = scopeThreadRef(ENVIRONMENT_ID, thread.id);
+  // Answered, since an unanswered command, such as the visit, holds every later one on the thread.
+  using _environment = installFakeEnvironment([thread], { acceptCommands: true });
+  // The thread's detail never arrives, as while it is still loading.
+  using _detail = options.withoutDetail
+    ? answerRpc(ORCHESTRATION_V2_WS_METHODS.subscribeThread, () => Stream.never)
+    : undefined;
+  __setClientSettingsForTests({
+    ...DEFAULT_CLIENT_SETTINGS,
+    onboardingCompletedAt: "2026-01-01T00:00:00.000Z",
+  });
+  const router = getRouter(
+    createMemoryHistory({ initialEntries: [`/${ENVIRONMENT_ID}/${thread.id}`] }),
+  );
+  await router.load();
+  await using _app = await render(<AppRoot router={router} />, {
+    // AppRoot brings its own router.
+    router: false,
+  });
+  if (!options.withoutDetail) {
+    await expect.element(page.getByText(`Answer 0 for ${thread.id}.`)).toBeVisible();
+  }
+  const liveShell = options.liveShell;
+  if (liveShell) {
+    // Sent on the shell stream itself, so the shell moves ahead of whatever the detail shows.
+    await vi.waitFor(async () => {
+      await emitShellThread({ ...thread, shell: liveShell });
+      expect(
+        appAtomRegistry.get(environmentThreadShells.threadShellAtom(threadRef))?.runtime
+          ?.activeRunId,
+      ).toBe(liveShell.activeRunId);
+    });
+  }
+  const moreControls = page.getByRole("button", { name: "More composer controls" });
+  await expect.element(moreControls).toBeVisible();
+  await options.beforePick?.();
+
+  await moreControls.click();
+  await page.getByRole("menuitemradio", { name: "Supervised" }).click();
+
+  await vi.waitFor(
+    () => {
+      const draft = useComposerDraftStore.getState().getComposerDraft(threadRef);
+      expect({
+        sent: dispatchedCommands().flatMap((command) =>
+          command.type === "thread.runtime-mode.set" ? [command.runtimeMode] : [],
+        ),
+        held: {
+          runtimeMode: draft?.runtimeMode ?? null,
+          runtimeModeBase: draft?.runtimeModeBase ?? null,
+        },
+      }).toEqual(expected);
+    },
+    { timeout: 5000 },
+  );
+}
+
+it("a permission pick on an idle thread sets the thread's mode at once", async () => {
+  await pickSupervised(
+    threadWithHistory("mode-pick-idle", 1),
+    {},
+    { sent: ["approval-required"], held: NOTHING_HELD },
+  );
+});
+
+it("a permission pick during a run sets the mode at once when the session switches in place", async () => {
+  await pickSupervised(
+    {
+      ...withLatestRunRunning(threadWithHistory("mode-pick-switches", 1)),
+      providerSessions: [
+        { providerInstanceId: CODEX_INSTANCE, switchesRuntimeModeInSession: true },
+      ],
+      shell: { activeRunId: RunId.make("mode-pick-switches-run-0"), status: "running" },
+    },
+    {},
+    { sent: ["approval-required"], held: NOTHING_HELD },
+  );
+});
+
+it("a permission pick waits for the next send while the detail of a running thread loads", async () => {
+  await pickSupervised(
+    threadWithHistory("mode-pick-no-detail", 1),
+    {
+      withoutDetail: true,
+      liveShell: { activeRunId: RunId.make("mode-pick-no-detail-run-0"), status: "running" },
+    },
+    { sent: [], held: HELD_SUPERVISED },
+  );
+});
+
+it("a permission pick waits for the next send when a detail behind the shell reports an in-place switch", async () => {
+  // The detail still shows the earlier run on a session that switches in place; the shell
+  // has moved on to a run on another provider.
+  const shellRunId = RunId.make("mode-pick-behind-run-2");
+  await pickSupervised(
+    {
+      ...withLatestRunRunning(threadWithHistory("mode-pick-behind", 2)),
+      providerSessions: [
+        { providerInstanceId: CODEX_INSTANCE, switchesRuntimeModeInSession: true },
+      ],
+    },
+    {
+      liveShell: {
+        providerInstanceId: CLAUDE_SELECTION.instanceId,
+        modelSelection: CLAUDE_SELECTION,
+        latestRunId: shellRunId,
+        activeRunId: shellRunId,
+        status: "running",
+      },
+    },
+    { sent: [], held: HELD_SUPERVISED },
+  );
+});
+
+it("a permission pick right after a send waits for the next send until the run shows", async () => {
+  await pickSupervised(
+    threadWithHistory("mode-pick-own-send", 1),
+    {
+      beforePick: async () => {
+        await userEvent.click(page.getByTestId("composer-editor"));
+        await userEvent.keyboard("Next step{Enter}");
+        await vi.waitFor(() =>
+          expect(dispatchedCommands().map((command) => command.type)).toContain("message.dispatch"),
+        );
+      },
+    },
+    { sent: [], held: HELD_SUPERVISED },
+  );
 });
 
 it("opening a thread or returning to the window on a touch tablet does not focus the composer", async () => {

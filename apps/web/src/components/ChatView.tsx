@@ -3099,8 +3099,18 @@ export default function ChatView(props: ChatViewProps) {
     void sendStandaloneCommand("/compact", gt("Failed to compact context."));
   };
 
+  // A permission pick applies at once only when this client knows that cannot end a run.
+  // The detail can be missing or behind the live shell, and this client's own send can
+  // still be on its way, so any of them reporting a run counts.
+  const runMayBeActive =
+    activeRuntime?.activeRunId != null || activeThread?.runtime?.activeRunId != null || isSendBusy;
+  // Trusted only from a detail that has caught up with the shell, on the shell's provider.
   const runtimeModeSwitchesInSession =
-    serverProjection?.providerSessions.findLast(
+    serverProjection !== null &&
+    activeThreadShell !== null &&
+    serverProjection.thread.providerInstanceId === activeThreadShell.providerInstanceId &&
+    !isDetailBehindShell(activeLatestRun, activeThreadShell.latestRun) &&
+    serverProjection.providerSessions.findLast(
       (session) => session.providerInstanceId === serverProjection.thread.providerInstanceId,
     )?.capabilities.sessions.supportsRuntimeModeSwitchInSession === true;
   const {
@@ -3116,6 +3126,7 @@ export default function ChatView(props: ChatViewProps) {
     draftThread,
     activeThread,
     activeRuntime,
+    runMayBeActive,
     runtimeModeSwitchesInSession,
     activeProjectSettings,
     settings,

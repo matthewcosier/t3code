@@ -109,6 +109,7 @@ function Picker(props: {
     draftThread: null,
     activeThread: props.thread,
     activeRuntime: props.runtime,
+    runMayBeActive: props.runtime?.activeRunId != null,
     runtimeModeSwitchesInSession: props.runtimeModeSwitchesInSession ?? false,
     activeProjectSettings: { settings: { newWorktreesStartFromOrigin: false } },
     settings: DEFAULT_UNIFIED_SETTINGS,

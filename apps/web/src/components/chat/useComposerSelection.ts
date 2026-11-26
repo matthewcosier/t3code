@@ -49,6 +49,8 @@ interface ComposerSelectionInput {
   readonly draftThread: DraftSessionState | null;
   readonly activeThread: EnvironmentThreadShell | undefined;
   readonly activeRuntime: ReturnType<typeof deriveThreadStructureRuntime>;
+  /** Whether a run may be active on the thread; true whenever this client cannot rule one out. */
+  readonly runMayBeActive: boolean;
   /** Whether the thread's provider session takes a new runtime mode without ending its run. */
   readonly runtimeModeSwitchesInSession: boolean;
   readonly activeProjectSettings: {
@@ -82,6 +84,7 @@ export function useComposerSelection(input: ComposerSelectionInput) {
     draftThread,
     activeThread,
     activeRuntime,
+    runMayBeActive,
     runtimeModeSwitchesInSession,
     activeProjectSettings,
     settings,
@@ -135,7 +138,7 @@ export function useComposerSelection(input: ComposerSelectionInput) {
       }
     } else if (
       mode !== activeThread.runtimeMode &&
-      activeRuntime?.activeRunId != null &&
+      runMayBeActive &&
       !runtimeModeSwitchesInSession
     ) {
       // Setting the mode now would end this run, so the pick waits for the next send.
