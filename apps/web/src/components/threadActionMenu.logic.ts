@@ -8,6 +8,9 @@ export type ThreadActionMenuId =
   | "find"
   | "new-thread-on-branch"
   | "filter-by-project"
+  | "set-project-owner"
+  | `set-project-owner:${string}`
+  | "detach-owner"
   | "turn-into-project"
   | "project-settings"
   | "pin"
@@ -127,6 +130,16 @@ export interface ThreadActionMenuState {
   readonly canShareWithGuest?: boolean;
   /** A No project thread with its own folder, on a server that can promote it. */
   readonly canTurnIntoProject?: boolean;
+  /** Projects this thread can own on its environment (null for ineligible threads). */
+  readonly projectOwnerMenu?: {
+    readonly projects: ReadonlyArray<{
+      readonly id: string;
+      readonly label: string;
+      readonly isOwner: boolean;
+    }>;
+  } | null;
+  /** Title of the owner thread managing this thread, when managed. */
+  readonly managedByOwnerTitle?: string | null;
 }
 
 /** Local navigation, read markers, and copying remain available to read-only clients. */
@@ -247,6 +260,37 @@ export function buildThreadActionMenuItems(
               ? resolve(msg("Show all projects"))
               : resolve(msg("Filter by {project}", { project: state.projectFilter.label })),
             icon: "folder-tree",
+          },
+        ]
+      : []),
+    ...(state.projectOwnerMenu && state.projectOwnerMenu.projects.length > 0
+      ? [
+          {
+            id: "set-project-owner" as const,
+            label: resolve(msg("Set as owner of…")),
+            icon: "folder-tree",
+            children: [
+              ...state.projectOwnerMenu.projects.map((project) => ({
+                id: `set-project-owner:${project.id}` as const,
+                label: project.label,
+                checked: project.isOwner,
+              })),
+              {
+                id: "set-project-owner:more" as const,
+                label: resolve(msg("Search projects…")),
+                icon: "text-search",
+                separatorBefore: true,
+              },
+            ],
+          },
+        ]
+      : []),
+    ...(state.managedByOwnerTitle
+      ? [
+          {
+            id: "detach-owner" as const,
+            label: resolve(msg("Detach from {owner}", { owner: state.managedByOwnerTitle })),
+            icon: "unlink",
           },
         ]
       : []),

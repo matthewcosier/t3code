@@ -50,6 +50,8 @@ vi.mock("../state/session", () => ({
 vi.mock("../state/entities", () => ({
   readEnvironmentServerConfigLoaded: () => true,
   readEnvironmentSupportsAutoSettleOptOut: () => true,
+  readProjects: () => [],
+  readThreadShells: () => [],
   readThreadShell: () => ({
     id: "thread",
     environmentId: "secondary",
@@ -57,6 +59,10 @@ vi.mock("../state/entities", () => ({
     title: "Thread",
     branch: "main",
     worktreePath: null,
+    archivedAt: null,
+    settledOverride: null,
+    lineage: { parentThreadId: null, rootThreadId: "thread", relationshipToParent: null },
+    managedByThreadId: null,
     runtime: null,
     latestRun: null,
   }),

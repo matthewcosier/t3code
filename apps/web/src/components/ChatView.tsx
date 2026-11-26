@@ -2,7 +2,10 @@ import { m } from "../i18n/messages";
 import { thrownErrorMessage } from "@t3tools/client-runtime/errors";
 import { useGT, useMessages } from "gt-react";
 import { ChildThreadApprovals } from "./chat/ChildThreadApprovals";
-import { draftSupportedRuntimeModes } from "./chat/runtimeModeConfig";
+import {
+  draftRuntimeModeLimitsInstance,
+  draftSupportedRuntimeModes,
+} from "./chat/runtimeModeConfig";
 import { workspaceAreaProps } from "../lib/workspaceFocus";
 import { sourceControlClients } from "@t3tools/client-runtime/source-control-clients";
 import { resolveNewThreadModelSelection } from "@t3tools/shared/usageLimits";
@@ -60,6 +63,7 @@ import { visibleThreadPullRequests } from "@t3tools/shared/threadPullRequests";
 import type { UsageLimitSourceSnapshots } from "@t3tools/contracts";
 import { feedbackBannerItem } from "./chat/ComposerFeedback";
 import { freshSessionBannerItem } from "./chat/ComposerFreshSession";
+import { projectOwnerEnrolmentBannerItem } from "./chat/ComposerProjectOwner";
 import { heldComposerSendBannerItem } from "./chat/ComposerHeldSendBanner";
 import { armFreshSession, disarmFreshSession, useFreshSessionArmed } from "./chat/freshSessionArms";
 import { cancelHeldComposerSend, useComposerSendHeld } from "./chat/preparingComposerImages";
@@ -299,6 +303,7 @@ import {
   useThreadStatus,
   useThreadHistory,
   useQuietThreadShell,
+  useThreadShell,
   useThreadCheckpointSummaries,
 } from "../state/entities";
 import { useEnvironmentShellHasSnapshot } from "../state/shell";
@@ -1229,6 +1234,11 @@ export default function ChatView(props: ChatViewProps) {
       ? scopeProjectRef(activeThreadEnvironmentId, activeThreadProjectId)
       : null;
   const activeProject = useProject(activeProjectRef);
+  const draftProjectOwnerThreadShell = useThreadShell(
+    !isServerThread && activeProject?.ownerThreadId != null
+      ? scopeThreadRef(activeProject.environmentId, activeProject.ownerThreadId)
+      : null,
+  );
   const activeProjectSettings = resolveProjectSettings(
     settings,
     activeProject?.id ?? null,
@@ -2850,6 +2860,23 @@ export default function ChatView(props: ChatViewProps) {
       freshSessionPending && activePendingApproval === null
         ? [freshSessionBannerItem(() => disarmFreshSession(routeThreadKey), messages)]
         : [];
+    const projectOwnerItems =
+      !isServerThread &&
+      draftProjectOwnerThreadShell !== null &&
+      draftProjectOwnerThreadShell.archivedAt === null &&
+      draftProjectOwnerThreadShell.settledOverride !== "settled" &&
+      draftThread?.skipOwnerEnrolment !== true
+        ? [
+            projectOwnerEnrolmentBannerItem(
+              {
+                ownerTitle: draftProjectOwnerThreadShell.title,
+                onOptOut: () =>
+                  setDraftThreadContext(composerDraftTarget, { skipOwnerEnrolment: true }),
+              },
+              messages,
+            ),
+          ]
+        : [];
     const heldSendItems = composerSendHeld
       ? [
           heldComposerSendBannerItem(
@@ -2867,6 +2894,7 @@ export default function ChatView(props: ChatViewProps) {
         ...usageLimitsItems,
         ...projectCloneItems,
         ...freshSessionItems,
+        ...projectOwnerItems,
         ...heldSendItems,
         ...systemComposerBannerItems,
       ];
@@ -2879,6 +2907,7 @@ export default function ChatView(props: ChatViewProps) {
       ...usageLimitsItems,
       ...projectCloneItems,
       ...freshSessionItems,
+      ...projectOwnerItems,
       ...heldSendItems,
       ...systemComposerBannerItems,
       branchMismatchBannerItem(
@@ -4114,6 +4143,11 @@ export default function ChatView(props: ChatViewProps) {
                                               multipleModelSelections,
                                               providerStatuses,
                                             )}
+                                            instanceId={draftRuntimeModeLimitsInstance(
+                                              activeProviderStatus?.instanceId,
+                                              multipleModelSelections,
+                                            )}
+                                            cwd={gitCwd}
                                             onRuntimeModeChange={handleRuntimeModeChangeStable}
                                           />
                                         ),

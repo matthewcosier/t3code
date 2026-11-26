@@ -131,6 +131,7 @@ import {
   type SelectTimelinePageResult,
   type ThreadHistoryPrefix,
 } from "./threadHistoryPaging.ts";
+import { routineSpan } from "@t3tools/shared/observability";
 
 export class ProjectionStoreApplyEventError extends Schema.TaggedError<ProjectionStoreApplyEventError>()(
   "ProjectionStoreApplyEventError",
@@ -647,6 +648,10 @@ export interface ProjectionStoreV2Shape {
   readonly listActiveThreads: (
     projectId?: ProjectId,
   ) => Effect.Effect<ReadonlyArray<ActiveThreadListEntry>, ProjectionStoreV2Error>;
+  /** Active (non-deleted, non-archived, unsettled) threads in `projectId` managed by a project owner. */
+  readonly listActiveManagedThreadsForProject: (
+    projectId: ProjectId,
+  ) => Effect.Effect<ReadonlyArray<OrchestrationV2AppThread>, ProjectionStoreV2Error>;
   /** Older settled thread ids below a cursor, newest settle first, and per-project counts. */
   readonly listOlderSettledThreads: (
     query: OlderSettledThreadsQuery,
@@ -1983,6 +1988,9 @@ export function threadShellFromProjection(
     ...(projection.thread.workflowRun === undefined
       ? {}
       : { workflowRun: projection.thread.workflowRun }),
+    ...(projection.thread.managedByThreadId === undefined
+      ? {}
+      : { managedByThreadId: projection.thread.managedByThreadId }),
     latestRunId: latestRun?.id ?? null,
     latestRunRequestedAt: latestRun?.requestedAt ?? null,
     latestRunStartedAt: latestRun?.startedAt ?? null,
@@ -2304,6 +2312,9 @@ function shellFromState(input: {
     ...(input.state.thread.workflowRun === undefined
       ? {}
       : { workflowRun: input.state.thread.workflowRun }),
+    ...(input.state.thread.managedByThreadId === undefined
+      ? {}
+      : { managedByThreadId: input.state.thread.managedByThreadId }),
     latestRunId: input.state.latestRunId,
     latestRunRequestedAt: input.state.latestRunRequestedAt,
     latestRunStartedAt: input.state.latestRunStartedAt,
@@ -6157,6 +6168,7 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
 
     const isNodeStored: ProjectionStoreV2Shape["isNodeStored"] = Effect.fn(
       "ProjectionStore.isNodeStored",
+      { attributes: routineSpan },
     )(
       function* (node) {
         const payloadJson = yield* encodeNodePayload(node);
@@ -9951,6 +9963,29 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
         )
         .pipe(Effect.mapError((cause) => new ProjectionStoreReadError({ threadId, cause })));
 
+    const listActiveManagedThreadsForProject = Effect.fn(
+      "ProjectionStore.listActiveManagedThreadsForProject",
+    )(function* (projectId: ProjectId) {
+      const rows = yield* sql<{ readonly payload_json: string }>`
+        SELECT t.payload_json
+        FROM orchestration_v2_projection_threads t
+        WHERE t.project_id = ${projectId}
+          AND t.deleted_at IS NULL
+          AND t.archived_at IS NULL
+          AND json_extract(t.payload_json, '$.managedByThreadId') IS NOT NULL
+          AND COALESCE(json_extract(t.payload_json, '$.settledOverride'), '') <> 'settled'
+      `.pipe(
+        Effect.mapError(
+          (cause) => new ProjectionStoreReadError({ threadId: ThreadId.make(projectId), cause }),
+        ),
+      );
+      return yield* Effect.forEach(rows, (row) => decodeThreadPayload(row.payload_json)).pipe(
+        Effect.mapError(
+          (cause) => new ProjectionStoreReadError({ threadId: ThreadId.make(projectId), cause }),
+        ),
+      );
+    });
+
     const readOnReader =
       <Args extends ReadonlyArray<unknown>, A, E, R>(
         method: (...args: Args) => Effect.Effect<A, E, R>,
@@ -9967,6 +10002,7 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
       countThreads: readOnReader(countThreads),
       listActiveShellIndex: readOnReader(listActiveShellIndex),
       listActiveThreads: readOnReader(listActiveThreads),
+      listActiveManagedThreadsForProject: readOnReader(listActiveManagedThreadsForProject),
       readShellSnapshot: readOnReader(readShellSnapshot),
       listOlderSettledThreads: readOnReader(listOlderSettledThreads),
       getThreadShell: readOnReader(getThreadShell),

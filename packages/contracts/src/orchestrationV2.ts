@@ -519,6 +519,7 @@ export const OrchestrationV2AppThread = Schema.Struct({
   linkOrigin: Schema.optional(OrchestrationV2LinkOrigin),
   delegatedFrom: Schema.optional(OrchestrationV2DelegatedFrom),
   workflowRun: Schema.optional(OrchestrationV2WorkflowOrigin),
+  managedByThreadId: Schema.optional(Schema.NullOr(ThreadId)),
   lineage: OrchestrationV2AppThreadLineage,
   forkedFrom: Schema.NullOr(
     Schema.Union([
@@ -1479,6 +1480,19 @@ export const OrchestrationV2NotificationSource = kindUnionWithFallback(
       childThreadId: Schema.optional(ThreadId),
     }),
     Schema.Struct({
+      kind: Schema.Literal("managed_thread"),
+      managedThreadId: ThreadId,
+      projectId: ProjectId,
+      reason: Schema.Literals([
+        "enrolled",
+        "question",
+        "approval",
+        "run_completed",
+        "owner_assigned",
+        "owner_replaced",
+      ]),
+    }),
+    Schema.Struct({
       kind: Schema.Literal("background_task"),
       work: Schema.Literal("subagent"),
       childThreadId: Schema.optional(ThreadId),
@@ -2434,6 +2448,7 @@ export const OrchestrationV2ThreadShell = Schema.Struct({
   linkOrigin: Schema.optional(OrchestrationV2LinkOrigin),
   delegatedFrom: Schema.optional(OrchestrationV2DelegatedFrom),
   workflowRun: Schema.optional(OrchestrationV2WorkflowOrigin),
+  managedByThreadId: Schema.optional(Schema.NullOr(ThreadId)),
   latestRunId: Schema.NullOr(RunId),
   latestRunRequestedAt: Schema.optional(Schema.NullOr(Schema.DateTimeUtc)),
   latestRunStartedAt: Schema.optional(Schema.NullOr(Schema.DateTimeUtc)),
@@ -3340,6 +3355,10 @@ export const OrchestrationV2Command = Schema.Union([
     delegatedFrom: Schema.optional(OrchestrationV2DelegatedFrom),
     /** Only the server sets this, for a thread that is a workflow run's agent step. */
     workflowRun: Schema.optional(OrchestrationV2WorkflowOrigin),
+    /** Only the server sets this when auto-enrolling a user thread under its project owner. */
+    managedByThreadId: Schema.optional(Schema.NullOr(ThreadId)),
+    /** Set by the client when the user opts out of automatic project-owner enrolment. */
+    skipOwnerEnrolment: Schema.optional(Schema.Boolean),
     importedNativeThread: Schema.optional(
       Schema.Struct({
         ref: Schema.Struct({
@@ -3499,6 +3518,8 @@ export const OrchestrationV2Command = Schema.Union([
     limitRecovery: Schema.optional(Schema.NullOr(OrchestrationV2LimitRecoveryUpdate)),
     /** Link (object) or unlink (null) a pull request; absent leaves it unchanged. */
     linkedPullRequest: Schema.optional(Schema.NullOr(ThreadLinkedPullRequest)),
+    /** Reassign or detach (null) this thread's project owner; absent leaves it unchanged. */
+    managedByThreadId: Schema.optional(Schema.NullOr(ThreadId)),
   }),
   Schema.Struct({
     type: Schema.Literal("thread.pull-request.link"),
@@ -4185,6 +4206,7 @@ export const OrchestrationV2ThreadLaunchInput = Schema.Struct({
   runtimeMode: RuntimeMode,
   interactionMode: ProviderInteractionMode,
   workspaceStrategy: OrchestrationV2ThreadLaunchWorkspaceStrategy,
+  skipOwnerEnrolment: Schema.optional(Schema.Boolean),
   initialMessage: Schema.optional(
     Schema.Struct({
       messageId: Schema.optional(MessageId),

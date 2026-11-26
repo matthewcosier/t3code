@@ -96,6 +96,7 @@ import {
 import { isPlaceholderThreadTitle } from "./placeholderThreadTitle.ts";
 import { combinePullRequestWatchWakes, type PullRequestWatchWake } from "./pullRequestWatch.ts";
 import { outputRequestProblem } from "./runOutput.ts";
+import * as WorktreeSetupTracker from "../project/WorktreeSetupTracker.ts";
 import { recordThreadOpen } from "@t3tools/shared/paletteSearch";
 import { isSlashCommand } from "@t3tools/shared/composerTrigger";
 import {
@@ -1661,6 +1662,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
   const idAllocator = yield* IdAllocator.IdAllocatorV2;
   const projects = yield* ProjectStore.ProjectStoreV2;
   const taskFolderStore = yield* TaskFolderStore.TaskFolderStore;
+  const worktreeSetupTracker = yield* WorktreeSetupTracker.WorktreeSetupTracker;
   const projectionStore = yield* ProjectionStoreV2;
   const effectOutbox = yield* EffectOutbox.EffectOutboxV2;
   const nextTurnItemOrdinal = (
@@ -2456,10 +2458,43 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
     messageId: MessageId,
     notification: OrchestrationV2ThreadProjection["messages"][number]["notification"],
   ) {
-    if (notification?.source.kind !== "delegated_task" || notification.outcome !== "updated")
-      return false;
-    const source = notification.source;
+    if (notification?.outcome !== "updated") return false;
     const threadId = projection.thread.id;
+    if (
+      notification.source.kind === "managed_thread" &&
+      (notification.source.reason === "question" || notification.source.reason === "approval")
+    ) {
+      const managedThreadId = notification.source.managedThreadId;
+      const managedOption = yield* projectionStore
+        .getThreadRecords(managedThreadId, ["runtimeRequests"])
+        .pipe(Effect.option);
+      if (Option.isNone(managedOption)) return true;
+      const managed = managedOption.value;
+      if (
+        managed.thread.deletedAt !== null ||
+        managed.thread.archivedAt !== null ||
+        managed.thread.managedByThreadId !== threadId
+      ) {
+        return true;
+      }
+      const reason = notification.source.reason;
+      const prefix =
+        reason === "approval"
+          ? `message:project-owner-approval:${threadId}:`
+          : `message:project-owner-question:${threadId}:`;
+      return !managed.runtimeRequests.some(
+        (request) =>
+          (reason === "approval"
+            ? request.kind !== "user_input" &&
+              request.kind !== "dynamic_tool_call" &&
+              request.kind !== "auth_refresh"
+            : request.kind === "user_input") &&
+          request.status === "pending" &&
+          messageId === `${prefix}${request.id}`,
+      );
+    }
+    if (notification.source.kind !== "delegated_task") return false;
+    const source = notification.source;
     const task =
       projection.subagents.find((candidate) => source.taskIds.includes(candidate.id)) ??
       // Command projections omit settled tasks whose result was already handed over.
@@ -4144,6 +4179,9 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         ? {}
         : { delegatedFrom: command.delegatedFrom }),
       ...(command.workflowRun === undefined ? {} : { workflowRun: command.workflowRun }),
+      ...(command.managedByThreadId === undefined || command.managedByThreadId === command.threadId
+        ? {}
+        : { managedByThreadId: command.managedByThreadId }),
       lineage: {
         parentThreadId: null,
         relationshipToParent: null,
@@ -5237,6 +5275,9 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
                 : {}),
             ...(command.branch === undefined ? {} : { branch: command.branch }),
             ...(command.worktreePath === undefined ? {} : { worktreePath: command.worktreePath }),
+            ...(command.managedByThreadId === undefined || command.managedByThreadId === thread.id
+              ? {}
+              : { managedByThreadId: command.managedByThreadId }),
             ...(command.linkedPullRequest === undefined
               ? {}
               : {
@@ -6158,15 +6199,22 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         cause: `Thread ${command.sourceThreadId} was deleted.`,
       });
     }
-    // The fork would copy no worktree path and run in the project checkout.
     if (
       command.sideChat === true &&
-      orchestrationV2WorktreePending(sourceProjection.thread.worktreePath, sourceProjection.runs)
+      (orchestrationV2WorktreePending(
+        sourceProjection.thread.worktreePath,
+        sourceProjection.runs,
+      ) ||
+        (yield* worktreeSetupTracker.workspaceIsHeld(command.sourceThreadId)))
     ) {
+      const workspaceStatus =
+        sourceProjection.thread.worktreePath === null
+          ? "has no worktree yet"
+          : "is still preparing its worktree";
       return yield* new OrchestratorDispatchError({
         commandId: command.commandId,
         commandType: command.type,
-        cause: `Thread ${command.sourceThreadId} has no worktree yet. Start the side chat once its worktree is set up.`,
+        cause: `Thread ${command.sourceThreadId} ${workspaceStatus}. Start the side chat once its worktree is set up.`,
       });
     }
     if ((yield* findThread(command.targetThreadId)) !== null) {
@@ -7551,10 +7599,12 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       });
       projection = applyToProjection(projection, event);
     }
-    // Background wakes and delegated completions continue work the user already snoozed, so
-    // only a message someone actually sent ends the snooze.
+    // Background wakes, delegated completions and scheduled-task runs continue work the user
+    // already snoozed, so only a message someone actually sent ends the snooze.
     const automaticWake =
-      command.notification !== undefined || command.delegatedCompletion !== undefined;
+      command.notification !== undefined ||
+      command.delegatedCompletion !== undefined ||
+      command.scheduledTaskId !== undefined;
     if (projection.thread.snoozedUntil != null && !automaticWake) {
       const now = yield* DateTime.now;
       const thread: OrchestrationV2AppThread = {
@@ -7907,7 +7957,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
             (id) =>
               projection.subagents.find((task) => task.id === id)?.completionWake === "always",
           )
-        : noticeKind === "delegated_task" || commandNotice)
+        : noticeKind === "delegated_task" || noticeKind === "managed_thread" || commandNotice)
     ) {
       const active = projection.runs.find((run) => run.status === "running");
       const providerThread = projection.providerThreads.find(
@@ -17697,5 +17747,6 @@ export const layer: Layer.Layer<
   | TaskFolderStore.TaskFolderStore
   | ThreadForkServiceV2
 > = Layer.effect(OrchestratorV2, makeOrchestrator()).pipe(
-  Layer.provide(ThreadCommandExecutor.layer),
+  // Layers memoize by reference, so this is the tracker ThreadLaunchService holds workspaces in.
+  Layer.provide(Layer.merge(ThreadCommandExecutor.layer, WorktreeSetupTracker.layer)),
 );

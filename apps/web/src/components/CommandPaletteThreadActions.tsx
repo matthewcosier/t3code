@@ -6,6 +6,7 @@ import {
   CopyIcon,
   FolderIcon,
   FolderPlusIcon,
+  FolderTreeIcon,
   GitBranchIcon,
   HashIcon,
   type LucideIcon,
@@ -15,8 +16,10 @@ import {
   PinIcon,
   PinOffIcon,
   RefreshCwIcon,
+  TextSearchIcon,
   TimerIcon,
   Trash2Icon,
+  UnlinkIcon,
 } from "lucide-react";
 
 import { useThreadActionMenu } from "../hooks/useThreadActionMenu";
@@ -35,6 +38,7 @@ const ICONS: Record<string, LucideIcon> = {
   copy: CopyIcon,
   folder: FolderIcon,
   "folder-plus": FolderPlusIcon,
+  "folder-tree": FolderTreeIcon,
   "git-branch": GitBranchIcon,
   hash: HashIcon,
   "mail-open": MailOpenIcon,
@@ -43,8 +47,10 @@ const ICONS: Record<string, LucideIcon> = {
   pin: PinIcon,
   "pin-off": PinOffIcon,
   "refresh-cw": RefreshCwIcon,
+  "text-search": TextSearchIcon,
   timer: TimerIcon,
   trash: Trash2Icon,
+  unlink: UnlinkIcon,
 };
 
 // The palette has its own rows for these, and no inline title editor for rename.

@@ -46,6 +46,7 @@ import * as PreviewAgentActivity from "../preview/PreviewAgentActivity.ts";
 import * as ServerSettings from "../serverSettings.ts";
 import * as CheckpointService from "./CheckpointService.ts";
 import * as EventSink from "./EventSink.ts";
+import type * as ManagedThreadAppContext from "./ManagedThreadAppContext.ts";
 import * as IdAllocator from "@t3tools/provider-core/server/IdAllocator";
 import * as ProviderAdapter from "@t3tools/provider-core/server/ProviderAdapter";
 import { PROVIDER_STOP_REASON_SIGNAL } from "@t3tools/provider-core/server/subagentProjection";
@@ -679,6 +680,7 @@ export interface RunExecutionServiceV2StartRootRunInput {
   readonly message: ProviderAdapter.ProviderAdapterV2TurnMessage;
   readonly modelSelection: ModelSelection;
   readonly runtimePolicy: ProviderAdapter.ProviderAdapterV2RuntimePolicy;
+  readonly extraAppContext?: ReadonlyArray<ManagedThreadAppContext.ManagedThreadOwnerContextEntry>;
 }
 
 type RunBaselineInput = Pick<
@@ -2272,10 +2274,10 @@ export const layer: Layer.Layer<
           }),
         );
         yield* touchMcpCredential;
-        const appContext = yield* McpAppModelContext.forProvider(
-          mcpAppModelContext,
-          input.run.threadId,
-        );
+        const appContext = [
+          ...(yield* McpAppModelContext.forProvider(mcpAppModelContext, input.run.threadId)),
+          ...(input.extraAppContext ?? []),
+        ];
         const turnInput = {
           appThread: input.appThread,
           threadId: input.run.threadId,

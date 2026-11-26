@@ -88,4 +88,41 @@ describe("buildThreadActionMenuItems", () => {
     const items = buildThreadActionMenuItems({ ...baseState, canRename: false });
     expect(items.filter((item) => item.disabled).map((item) => item.id)).toEqual(["rename"]);
   });
+
+  it("includes project owner submenu with checked projects, search trigger, and detach action", () => {
+    const items = buildThreadActionMenuItems({
+      ...baseState,
+      projectOwnerMenu: {
+        projects: [
+          { id: "proj-a", label: "Alpha", isOwner: true },
+          { id: "proj-b", label: "Beta", isOwner: false },
+        ],
+      },
+      managedByOwnerTitle: "Lead Thread",
+    });
+
+    const ownerSubmenu = items.find((item) => item.id === "set-project-owner");
+    expect(ownerSubmenu?.children?.map((child) => [child.id, child.checked])).toEqual([
+      ["set-project-owner:proj-a", true],
+      ["set-project-owner:proj-b", false],
+      ["set-project-owner:more", undefined],
+    ]);
+    expect(items.find((item) => item.id === "detach-owner")?.disabled).toBeUndefined();
+
+    const readOnly = buildThreadActionMenuItems({
+      ...baseState,
+      canOperate: false,
+      projectOwnerMenu: {
+        projects: [{ id: "proj-a", label: "Alpha", isOwner: false }],
+      },
+      managedByOwnerTitle: "Lead Thread",
+    });
+    expect(readOnly.find((item) => item.id === "set-project-owner")?.disabled).toBe(true);
+    expect(
+      readOnly
+        .find((item) => item.id === "set-project-owner")
+        ?.children?.every((child) => child.disabled),
+    ).toBe(true);
+    expect(readOnly.find((item) => item.id === "detach-owner")?.disabled).toBe(true);
+  });
 });

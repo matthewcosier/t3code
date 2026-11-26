@@ -1,5 +1,5 @@
 import { assert, it } from "@effect/vitest";
-import { EventId, ProjectId, ProviderInstanceId } from "@t3tools/contracts";
+import { EventId, ProjectId, ProviderInstanceId, ThreadId } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
@@ -161,6 +161,75 @@ it.layer(ProjectStore.layer.pipe(Layer.provideMerge(SqlitePersistence.layerMemor
           "custom repo",
         );
       }),
+    );
+
+    it.effect(
+      "persists ownerThreadId, keeps it across unrelated updates, and lists owned projects",
+      () =>
+        Effect.gen(function* () {
+          const projects = yield* ProjectStore.ProjectStoreV2;
+          const projectId = ProjectId.make("project-owner-store");
+          const ownerId = ThreadId.make("thread:store-owner");
+          const at = "2026-03-24T00:00:00.000Z";
+          const event = {
+            aggregateKind: "project",
+            aggregateId: projectId,
+            occurredAt: at,
+            commandId: null,
+            causationEventId: null,
+            correlationId: null,
+            metadata: {},
+          } as const;
+          yield* projects.apply({
+            ...event,
+            sequence: 1,
+            eventId: EventId.make("event-owner-created"),
+            type: "project.created",
+            payload: {
+              projectId,
+              title: "Owned Project",
+              workspaceRoot: "/tmp/owned-project",
+              defaultModelSelection: null,
+              scripts: [],
+              createdAt: at,
+              updatedAt: at,
+            },
+          });
+          yield* projects.apply({
+            ...event,
+            sequence: 2,
+            eventId: EventId.make("event-owner-set"),
+            type: "project.meta-updated",
+            payload: { projectId, ownerThreadId: ownerId, updatedAt: at },
+          });
+          yield* projects.apply({
+            ...event,
+            sequence: 3,
+            eventId: EventId.make("event-owner-unrelated"),
+            type: "project.meta-updated",
+            payload: { projectId, title: "Owned Project Renamed", updatedAt: at },
+          });
+
+          const row = Option.getOrNull(yield* projects.get(projectId));
+          assert.strictEqual(row?.ownerThreadId, ownerId);
+          const shell = Option.getOrNull(yield* projects.getShell(projectId));
+          assert.strictEqual(shell?.ownerThreadId, ownerId);
+          const owned = yield* projects.listByOwnerThreadId(ownerId);
+          assert.deepStrictEqual(
+            owned.map((entry) => entry.projectId),
+            [projectId],
+          );
+
+          yield* projects.apply({
+            ...event,
+            sequence: 4,
+            eventId: EventId.make("event-owner-clear"),
+            type: "project.meta-updated",
+            payload: { projectId, ownerThreadId: null, updatedAt: at },
+          });
+          assert.strictEqual(Option.getOrNull(yield* projects.get(projectId))?.ownerThreadId, null);
+          assert.deepStrictEqual(yield* projects.listByOwnerThreadId(ownerId), []);
+        }),
     );
   },
 );

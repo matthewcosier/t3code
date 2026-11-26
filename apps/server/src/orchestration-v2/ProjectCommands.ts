@@ -9,6 +9,7 @@ import {
   type ProjectTrackedFolder,
   SCRIPT_RUN_COMMAND_PATTERN,
   type ThreadEnvMode,
+  type ThreadId,
 } from "@t3tools/contracts";
 import * as DateTime from "effect/DateTime";
 import * as Result from "effect/Result";
@@ -42,6 +43,7 @@ export interface ProjectMetaUpdateCommand {
   readonly trackedFolders?: ReadonlyArray<ProjectTrackedFolder>;
   readonly pinned?: boolean;
   readonly archived?: boolean;
+  readonly ownerThreadId?: ThreadId | null;
 }
 
 export interface ProjectDeleteCommand {
@@ -226,6 +228,7 @@ export function planProjectCommand(input: {
           ...(command.archived === undefined
             ? {}
             : { archivedAt: command.archived ? (project.archivedAt ?? occurredAt) : null }),
+          ...(command.ownerThreadId === undefined ? {} : { ownerThreadId: command.ownerThreadId }),
           updatedAt: occurredAt,
         },
       });

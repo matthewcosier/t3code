@@ -301,10 +301,14 @@ function WorkEntryLogRow(props: WorkEntryRowProps) {
     workEntry.projectedItem?.item.type === "thread_created"
       ? workEntry.projectedItem.item
       : undefined;
-  const notifiedSubagentThreadId =
+  const notifiedSource =
     workEntry.projectedItem?.item.type === "notification"
-      ? notificationChildThreadId(workEntry.projectedItem.item.source)
+      ? workEntry.projectedItem.item.source
       : undefined;
+  const notifiedSubagentThreadId = notifiedSource
+    ? notificationChildThreadId(notifiedSource)
+    : undefined;
+  const notifiedIsManagedThread = notifiedSource?.kind === "managed_thread";
   const groupView = use(WorkGroupViewCtx);
   const [expanded, setExpanded] = useState(
     () => groupView?.state.expandedEntries.has(workEntry.id) ?? false,
@@ -672,14 +676,14 @@ function WorkEntryLogRow(props: WorkEntryRowProps) {
           ) : null}
           {notifiedSubagentThreadId ? (
             <InlineButton
-              aria-label={gt("Open subagent thread")}
+              aria-label={notifiedIsManagedThread ? gt("Open thread") : gt("Open subagent thread")}
               onClick={(event) => {
                 event.stopPropagation();
                 ctx.onOpenThread(notifiedSubagentThreadId);
               }}
               onKeyDown={stopRowToggle}
             >
-              <T>Open subagent</T>
+              {notifiedIsManagedThread ? <T>Open thread</T> : <T>Open subagent</T>}
             </InlineButton>
           ) : null}
           {showFailedIndicator &&
