@@ -1517,6 +1517,10 @@ export function useComposerSend(input: ComposerSendInput) {
     let backgroundDraftOpened = false;
     let turnStartSucceeded = false;
     if (failure === null && turnAttachmentsResult._tag === "Success") {
+      const liveDraftSession =
+        isLocalDraftThread && draftId !== null
+          ? useComposerDraftStore.getState().getDraftSession(draftId)
+          : null;
       const bootstrap =
         isLocalDraftThread || baseBranchForWorktree
           ? {
@@ -1531,6 +1535,9 @@ export function useComposerSend(input: ComposerSendInput) {
                       branch: activeThreadBranch,
                       worktreePath: activeThread.worktreePath,
                       createdAt: activeThread.createdAt,
+                      ...(liveDraftSession?.skipOwnerEnrolment === true
+                        ? { skipOwnerEnrolment: true }
+                        : {}),
                     },
                   }
                 : {}),

@@ -83,6 +83,7 @@ export interface UpdateProjectInput extends CommandMetadata {
   readonly untrackFolders?: ReadonlyArray<string>;
   readonly pinned?: boolean;
   readonly archived?: boolean;
+  readonly ownerThreadId?: ThreadId | null;
 }
 
 export interface DeleteProjectInput extends CommandMetadata {
@@ -156,6 +157,7 @@ export interface UpdateThreadMetadataInput extends ThreadCommandInput {
   readonly worktreePath?: string | null;
   readonly regenerateTitle?: boolean;
   readonly linkedPullRequest?: ThreadLinkedPullRequest | null;
+  readonly managedByThreadId?: ThreadId | null;
   readonly expectedEmpty?: boolean;
 }
 
@@ -177,6 +179,7 @@ interface StartThreadBootstrap {
     readonly branch: string | null;
     readonly worktreePath: string | null;
     readonly createdAt: string;
+    readonly skipOwnerEnrolment?: boolean;
   };
   readonly prepareWorktree?: {
     readonly requireWorktree?: boolean;
@@ -429,6 +432,7 @@ const mutateProject = Effect.fn("EnvironmentCommands.mutateProject")(function* (
         readonly trackedFolders?: ReadonlyArray<ProjectTrackedFolder>;
         readonly trackFolders?: ReadonlyArray<ProjectTrackedFolder>;
         readonly untrackFolders?: ReadonlyArray<string>;
+        readonly ownerThreadId?: ThreadId | null;
       }
     | {
         readonly type: "project.delete";
@@ -484,6 +488,7 @@ export const updateProject = Effect.fn("EnvironmentCommands.updateProject")(func
     ...(input.untrackFolders === undefined ? {} : { untrackFolders: input.untrackFolders }),
     ...(input.pinned === undefined ? {} : { pinned: input.pinned }),
     ...(input.archived === undefined ? {} : { archived: input.archived }),
+    ...(input.ownerThreadId === undefined ? {} : { ownerThreadId: input.ownerThreadId }),
   });
 });
 
@@ -724,6 +729,7 @@ export const updateThreadMetadata = Effect.fn("EnvironmentCommands.updateThreadM
       input.worktreePath !== undefined ||
       input.regenerateTitle !== undefined ||
       input.linkedPullRequest !== undefined ||
+      input.managedByThreadId !== undefined ||
       input.limitRecovery !== undefined
     ) {
       result = yield* dispatch({
@@ -739,6 +745,9 @@ export const updateThreadMetadata = Effect.fn("EnvironmentCommands.updateThreadM
         ...(input.linkedPullRequest === undefined
           ? {}
           : { linkedPullRequest: input.linkedPullRequest }),
+        ...(input.managedByThreadId === undefined
+          ? {}
+          : { managedByThreadId: input.managedByThreadId }),
       });
     }
     if (input.modelSelection !== undefined) {
@@ -837,6 +846,7 @@ export const startThreadTurn = Effect.fn("EnvironmentCommands.startThreadTurn")(
       runtimeMode: input.runtimeMode,
       interactionMode: input.interactionMode,
       workspaceStrategy,
+      ...(bootstrap?.skipOwnerEnrolment === true ? { skipOwnerEnrolment: true } : {}),
       initialMessage: {
         messageId: input.message.messageId,
         text: input.message.text,

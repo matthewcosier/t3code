@@ -131,6 +131,38 @@ export interface ThreadLaunchInput {
   readonly delegatedFrom?: OrchestrationV2DelegatedFrom;
   /** The workflow run this thread is an agent step of. */
   readonly workflowRun?: OrchestrationV2WorkflowOrigin;
+  /** True when the user opted out of automatic enrolment under the project's owner thread. */
+  readonly skipOwnerEnrolment?: boolean;
+}
+
+const HUMAN_CREATION_SOURCES = new Set<OrchestrationV2CreationSource>(["web", "mobile"]);
+
+export function shouldAutoEnrolWithProjectOwner(input: {
+  readonly createdBy: OrchestrationV2Actor;
+  readonly creationSource: OrchestrationV2CreationSource;
+  readonly reuseExistingThread?: boolean | undefined;
+  readonly skipOwnerEnrolment?: boolean | undefined;
+  readonly linkOrigin?: OrchestrationV2LinkOrigin | undefined;
+  readonly delegatedFrom?: OrchestrationV2DelegatedFrom | undefined;
+  readonly workflowRun?: OrchestrationV2WorkflowOrigin | undefined;
+  readonly importedNativeThread?: unknown;
+  readonly scheduledTaskId?: ScheduledTaskId | undefined;
+  readonly ownerThreadId?: ThreadId | null | undefined;
+  readonly candidateThreadId: ThreadId;
+}): boolean {
+  return (
+    input.reuseExistingThread !== true &&
+    input.skipOwnerEnrolment !== true &&
+    input.createdBy === "user" &&
+    HUMAN_CREATION_SOURCES.has(input.creationSource) &&
+    input.linkOrigin === undefined &&
+    input.delegatedFrom === undefined &&
+    input.workflowRun === undefined &&
+    input.importedNativeThread === undefined &&
+    input.scheduledTaskId === undefined &&
+    input.ownerThreadId != null &&
+    input.ownerThreadId !== input.candidateThreadId
+  );
 }
 
 type PreparationInput = Pick<
@@ -1558,6 +1590,36 @@ const make = Effect.gen(function* () {
                   : { outputSchema: input.initialMessage.outputSchema }),
                 ...(input.generateTitle === true ? { titleSeed: input.title } : {}),
               };
+        const managedByThreadId = yield* Effect.gen(function* () {
+          if (
+            !shouldAutoEnrolWithProjectOwner({
+              createdBy: input.createdBy,
+              creationSource: input.creationSource,
+              reuseExistingThread: input.reuseExistingThread,
+              skipOwnerEnrolment: input.skipOwnerEnrolment,
+              linkOrigin: input.linkOrigin,
+              delegatedFrom: input.delegatedFrom,
+              workflowRun: input.workflowRun,
+              importedNativeThread: input.importedNativeThread,
+              scheduledTaskId: input.initialMessage?.scheduledTaskId,
+              ownerThreadId: project.ownerThreadId,
+              candidateThreadId,
+            }) ||
+            project.ownerThreadId == null
+          ) {
+            return undefined;
+          }
+          const owner = yield* projections.getThread(project.ownerThreadId).pipe(Effect.option);
+          if (
+            Option.isNone(owner) ||
+            owner.value.deletedAt !== null ||
+            owner.value.archivedAt !== null ||
+            owner.value.settledOverride === "settled"
+          ) {
+            return undefined;
+          }
+          return project.ownerThreadId;
+        });
         const claimDispatch =
           input.reuseExistingThread === true
             ? threads.dispatch({
@@ -1586,6 +1648,7 @@ const make = Effect.gen(function* () {
                   ? {}
                   : { delegatedFrom: input.delegatedFrom }),
                 ...(input.workflowRun === undefined ? {} : { workflowRun: input.workflowRun }),
+                ...(managedByThreadId === undefined ? {} : { managedByThreadId }),
                 createdBy: input.createdBy,
                 creationSource: input.creationSource,
                 ...(initialMessage === undefined

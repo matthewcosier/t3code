@@ -13,6 +13,7 @@ import {
   AuthSourceControlWriteScope,
   EnvironmentAuthorizationError,
   EnvironmentId,
+  type ScopedProjectRef,
   type ScopedThreadRef,
   ThreadId,
   sessionGrantsScope,
@@ -347,6 +348,12 @@ export function useThreadActions() {
   );
   const markThreadUnread = useMarkThreadUnread();
   const createProjectFromThread = useAtomCommand(projectEnvironment.createFromThread, {
+    reportFailure: false,
+  });
+  const updateProjectMutation = useOrchestrationCommand(projectEnvironment.update, {
+    reportFailure: false,
+  });
+  const updateThreadMetadataMutation = useOrchestrationCommand(threadEnvironment.updateMetadata, {
     reportFailure: false,
   });
   const stopThreadSession = useOrchestrationCommand(threadEnvironment.stopSession);
@@ -1078,6 +1085,16 @@ export function useThreadActions() {
       createProjectFromThread({
         environmentId: target.environmentId,
         input: { threadId: target.threadId },
+      }),
+    setProjectOwner: (target: ScopedProjectRef, ownerThreadId: ThreadId | null) =>
+      updateProjectMutation({
+        environmentId: target.environmentId,
+        input: { projectId: target.projectId, ownerThreadId },
+      }),
+    detachThreadFromOwner: (target: ScopedThreadRef) =>
+      updateThreadMetadataMutation({
+        environmentId: target.environmentId,
+        input: { threadId: target.threadId, managedByThreadId: null },
       }),
   };
 }

@@ -2458,10 +2458,43 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
     messageId: MessageId,
     notification: OrchestrationV2ThreadProjection["messages"][number]["notification"],
   ) {
-    if (notification?.source.kind !== "delegated_task" || notification.outcome !== "updated")
-      return false;
-    const source = notification.source;
+    if (notification?.outcome !== "updated") return false;
     const threadId = projection.thread.id;
+    if (
+      notification.source.kind === "managed_thread" &&
+      (notification.source.reason === "question" || notification.source.reason === "approval")
+    ) {
+      const managedThreadId = notification.source.managedThreadId;
+      const managedOption = yield* projectionStore
+        .getThreadRecords(managedThreadId, ["runtimeRequests"])
+        .pipe(Effect.option);
+      if (Option.isNone(managedOption)) return true;
+      const managed = managedOption.value;
+      if (
+        managed.thread.deletedAt !== null ||
+        managed.thread.archivedAt !== null ||
+        managed.thread.managedByThreadId !== threadId
+      ) {
+        return true;
+      }
+      const reason = notification.source.reason;
+      const prefix =
+        reason === "approval"
+          ? `message:project-owner-approval:${threadId}:`
+          : `message:project-owner-question:${threadId}:`;
+      return !managed.runtimeRequests.some(
+        (request) =>
+          (reason === "approval"
+            ? request.kind !== "user_input" &&
+              request.kind !== "dynamic_tool_call" &&
+              request.kind !== "auth_refresh"
+            : request.kind === "user_input") &&
+          request.status === "pending" &&
+          messageId === `${prefix}${request.id}`,
+      );
+    }
+    if (notification.source.kind !== "delegated_task") return false;
+    const source = notification.source;
     const task =
       projection.subagents.find((candidate) => source.taskIds.includes(candidate.id)) ??
       // Command projections omit settled tasks whose result was already handed over.
@@ -4146,6 +4179,9 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         ? {}
         : { delegatedFrom: command.delegatedFrom }),
       ...(command.workflowRun === undefined ? {} : { workflowRun: command.workflowRun }),
+      ...(command.managedByThreadId === undefined || command.managedByThreadId === command.threadId
+        ? {}
+        : { managedByThreadId: command.managedByThreadId }),
       lineage: {
         parentThreadId: null,
         relationshipToParent: null,
@@ -5239,6 +5275,9 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
                 : {}),
             ...(command.branch === undefined ? {} : { branch: command.branch }),
             ...(command.worktreePath === undefined ? {} : { worktreePath: command.worktreePath }),
+            ...(command.managedByThreadId === undefined || command.managedByThreadId === thread.id
+              ? {}
+              : { managedByThreadId: command.managedByThreadId }),
             ...(command.linkedPullRequest === undefined
               ? {}
               : {
@@ -7902,7 +7941,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
             (id) =>
               projection.subagents.find((task) => task.id === id)?.completionWake === "always",
           )
-        : noticeKind === "delegated_task" || commandNotice)
+        : noticeKind === "delegated_task" || noticeKind === "managed_thread" || commandNotice)
     ) {
       const active = projection.runs.find((run) => run.status === "running");
       const providerThread = projection.providerThreads.find(

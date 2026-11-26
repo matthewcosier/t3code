@@ -21,6 +21,7 @@ import * as Stream from "effect/Stream";
 import * as ProviderAdapter from "@t3tools/provider-core/server/ProviderAdapter";
 import * as McpAppModelContext from "../mcpApps/McpAppModelContext.ts";
 import * as EventSink from "./EventSink.ts";
+import * as ManagedThreadAppContext from "./ManagedThreadAppContext.ts";
 import * as ProjectionStore from "./ProjectionStore.ts";
 import * as ProviderSessionManager from "./ProviderSessionManager.ts";
 
@@ -448,10 +449,10 @@ export const layer: Layer.Layer<
               cause: "The persisted steering message or target run is missing.",
             });
           }
-          const appContext = yield* McpAppModelContext.forProvider(
-            mcpAppModelContext,
-            input.threadId,
-          );
+          const appContext = [
+            ...(yield* McpAppModelContext.forProvider(mcpAppModelContext, input.threadId)),
+            ...(yield* ManagedThreadAppContext.forProvider(projections, input.threadId)),
+          ];
           yield* loaded.session.value
             .steerTurn({
               threadId: input.threadId,

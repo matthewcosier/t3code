@@ -932,6 +932,8 @@ export function notificationChildThreadId(
     case "subagent":
     case "delegated_task":
       return source.childThreadId;
+    case "managed_thread":
+      return source.managedThreadId;
     case "command":
     case "monitor":
     case "background_task":
