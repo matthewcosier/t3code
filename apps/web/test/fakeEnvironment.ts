@@ -13,7 +13,9 @@ import {
   ORCHESTRATION_PROTOCOL_VERSION,
   ORCHESTRATION_V2_WS_METHODS,
   ProjectId,
+  ProviderDriverKind,
   ProviderInstanceId,
+  ProviderSessionId,
   RunId,
   RuntimeRequestId,
   ServerConfig,
@@ -26,6 +28,8 @@ import {
   type OrchestrationProjectShell,
   type OrchestrationV2Command,
   type OrchestrationV2ProjectedTurnItem,
+  type OrchestrationV2ProviderCapabilities,
+  type OrchestrationV2ProviderSession,
   type OrchestrationV2ProviderThread,
   type OrchestrationV2Run,
   type OrchestrationV2ShellStreamItem,
@@ -35,6 +39,7 @@ import {
   type OrchestrationV2TurnItem,
   type TerminalMetadataStreamEvent,
   type ResolvedKeybindingsConfig,
+  type RuntimeMode,
 } from "@t3tools/contracts";
 import type {
   ConnectionAttemptError,
@@ -240,6 +245,8 @@ export interface FakeThread {
   readonly title: string;
   /** Defaults to GPT-5.4 on Codex. */
   readonly modelSelection?: ModelSelection;
+  /** Defaults to full access. */
+  readonly runtimeMode?: RuntimeMode;
   /** The first is the thread's active provider thread. */
   readonly providerThreads?: ReadonlyArray<OrchestrationV2ProviderThread>;
   readonly issues?: OrchestrationV2ThreadShell["issues"];
@@ -247,6 +254,18 @@ export interface FakeThread {
   readonly runs: ReadonlyArray<OrchestrationV2Run>;
   readonly items: ReadonlyArray<OrchestrationV2TurnItem>;
   readonly runtimeRequests?: OrchestrationV2ThreadProjection["runtimeRequests"];
+  /** What the live shell reports past the detail, such as a run the detail does not show yet. */
+  readonly shell?: Partial<
+    Pick<
+      OrchestrationV2ThreadShell,
+      "providerInstanceId" | "modelSelection" | "latestRunId" | "activeRunId" | "status"
+    >
+  >;
+  /** The detail's provider sessions, oldest first. */
+  readonly providerSessions?: ReadonlyArray<{
+    readonly providerInstanceId: ProviderInstanceId;
+    readonly switchesRuntimeModeInSession: boolean;
+  }>;
 }
 
 /** A thread of `turns` user prompts, each answered in markdown with a list and inline code. */
@@ -319,7 +338,8 @@ export function threadWithQuestion(name: string, question: string): FakeThread {
 
 const parentOf = (thread: FakeThread) => thread.sideChatOf ?? thread.providerSubagentOf;
 
-function shellOf(thread: FakeThread): OrchestrationV2ThreadShell {
+/** The shell the thread's detail agrees with. */
+function detailShellOf(thread: FakeThread): OrchestrationV2ThreadShell {
   const latest = thread.runs.at(-1);
   const modelSelection = thread.modelSelection ?? MODEL;
   return {
@@ -328,7 +348,7 @@ function shellOf(thread: FakeThread): OrchestrationV2ThreadShell {
     title: thread.title,
     providerInstanceId: modelSelection.instanceId,
     modelSelection,
-    runtimeMode: "full-access",
+    runtimeMode: thread.runtimeMode ?? "full-access",
     interactionMode: "default",
     branch: "main",
     worktreePath: null,
@@ -364,8 +384,127 @@ function shellOf(thread: FakeThread): OrchestrationV2ThreadShell {
   };
 }
 
+/** The live shell, which can report more than the thread's detail does. */
+function shellOf(thread: FakeThread): OrchestrationV2ThreadShell {
+  return { ...detailShellOf(thread), ...thread.shell };
+}
+
+const sessionCapabilities = (
+  supportsRuntimeModeSwitchInSession: boolean,
+): OrchestrationV2ProviderCapabilities => ({
+  sessions: {
+    supportsMultipleProviderThreadsPerSession: false,
+    supportsModelSwitchInSession: true,
+    supportsProviderSwitchingViaHandoff: true,
+    supportsRuntimeModeSwitchInSession,
+    pendingRequestsSurviveRestart: false,
+  },
+  threads: {
+    canCreateEmptyThread: true,
+    canReadThreadSnapshot: false,
+    canRollbackThread: false,
+    canForkThread: false,
+    canForkFromTurn: false,
+    canForkFromSubagentThread: false,
+    exposesNativeThreadId: false,
+  },
+  turns: {
+    exposesNativeTurnId: false,
+    emitsTurnStarted: true,
+    emitsTurnCompleted: true,
+    supportsInterrupt: true,
+    supportsActiveSteering: false,
+    supportsSteeringByInterruptRestart: false,
+    supportsQueuedMessages: true,
+    terminalStatusQuality: "strong",
+  },
+  streaming: {
+    streamsAssistantText: true,
+    streamsReasoning: false,
+    streamsToolOutput: false,
+    streamsPlanText: false,
+    emitsMessageCompleted: true,
+  },
+  tools: {
+    exposesToolItemIds: false,
+    emitsToolStarted: false,
+    emitsToolCompleted: false,
+    emitsToolOutput: false,
+    supportsMcpTools: false,
+    supportsDynamicToolCallbacks: false,
+  },
+  approvals: {
+    supportsCommandApproval: false,
+    supportsFileReadApproval: false,
+    supportsFileChangeApproval: false,
+    supportsApplyPatchApproval: false,
+    approvalsHaveNativeRequestIds: false,
+    approvalCallbacksAreLiveOnly: false,
+    approvalsCanOriginateFromSubagents: false,
+  },
+  planning: {
+    emitsPlanUpdated: false,
+    emitsTodoList: false,
+    emitsProposedPlan: false,
+    supportsStructuredQuestions: false,
+    planDeltasHaveItemIds: false,
+  },
+  subagents: {
+    supportsSubagents: false,
+    exposesSubagentThreadIds: false,
+    emitsSubagentLifecycle: false,
+    canWaitForSubagents: false,
+    canCloseSubagents: false,
+    canForkSubagentThread: false,
+  },
+  context: {
+    acceptsSystemContext: false,
+    acceptsDeveloperContext: false,
+    acceptsSyntheticUserContext: true,
+    canGenerateSummaries: false,
+    canConsumeHandoffSummaries: false,
+    supportsDeltaHandoff: false,
+    supportsFullThreadHandoff: false,
+    maxRecommendedHandoffChars: null,
+  },
+  checkpointing: {
+    appCanCheckpointFilesystem: false,
+    supportsNestedCheckpointScopes: false,
+    providerCanRollbackConversation: false,
+    providerRollbackReturnsSnapshot: false,
+    providerCanReadConversationSnapshot: false,
+  },
+  identity: {
+    nativeThreadIds: "none",
+    nativeTurnIds: "none",
+    nativeItemIds: "none",
+    nativeRequestIds: "none",
+  },
+  runtimePolicy: { enforcement: "client-boundary" },
+});
+
+function sessionOf(
+  thread: FakeThread,
+  session: NonNullable<FakeThread["providerSessions"]>[number],
+  index: number,
+): OrchestrationV2ProviderSession {
+  return {
+    id: ProviderSessionId.make(`${thread.id}-session-${index}`),
+    driver: ProviderDriverKind.make(session.providerInstanceId),
+    providerInstanceId: session.providerInstanceId,
+    status: "ready",
+    cwd: "/workspace/render",
+    model: null,
+    capabilities: sessionCapabilities(session.switchesRuntimeModeInSession),
+    extensionStatuses: [],
+    createdAt: AT,
+    updatedAt: AT,
+    lastError: null,
+  };
+}
+
 function projectionOf(thread: FakeThread): OrchestrationV2ThreadProjection {
-  const shell = shellOf(thread);
+  const shell = detailShellOf(thread);
   const visibleTurnItems: OrchestrationV2ProjectedTurnItem[] = thread.items.map(
     (item, position) => ({
       position,
@@ -403,7 +542,9 @@ function projectionOf(thread: FakeThread): OrchestrationV2ThreadProjection {
     attempts: [],
     nodes: [],
     subagents: [],
-    providerSessions: [],
+    providerSessions: (thread.providerSessions ?? []).map((session, index) =>
+      sessionOf(thread, session, index),
+    ),
     providerThreads: [...(thread.providerThreads ?? [])],
     providerTurns: [],
     runtimeRequests: [...(thread.runtimeRequests ?? [])],
@@ -715,6 +856,20 @@ export function answerRpc(method: string, handler: (input: never) => unknown): D
       else delete handlers[method];
     },
   };
+}
+
+/** Delivers `thread`'s live shell to the shell subscription, ahead of anything its detail shows. */
+export async function emitShellThread(thread: FakeThread): Promise<void> {
+  if (!shellSubscriber) throw new Error("No live shell subscription");
+  sequence += 1;
+  await Effect.runPromise(
+    Queue.offer(shellSubscriber, {
+      kind: "thread.updated",
+      sequence,
+      location: "active",
+      thread: shellOf(thread),
+    }),
+  );
 }
 
 /** Delivers one domain event, such as a run or turn-item update, to the thread's subscription. */
