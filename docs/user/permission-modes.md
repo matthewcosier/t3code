@@ -5,6 +5,9 @@ composer; it applies to that thread. A new thread names its mode under the compo
 on your default mode, open the model picker and choose **Permissions** at its bottom, or press
 `mod+shift+a`. A thread on another mode shows the mode next to the model.
 
+A mode you choose on an existing thread applies to the thread at once. While the agent is working
+on a provider that cannot change modes mid-turn, it applies with your next message instead.
+
 Set the default for new threads in **Settings → Threads → New threads → Permissions**.
 Projects can override the environment default. New threads use this setting rather than the
 mode of the thread you were viewing. The initial default is **Full access**; existing threads

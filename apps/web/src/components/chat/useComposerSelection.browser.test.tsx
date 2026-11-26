@@ -91,6 +91,7 @@ function Picker(props: {
     draftThread: null,
     activeThread: props.thread,
     activeRuntime: props.runtime,
+    runtimeModePickRun: { detail: null, shell: null, sendInFlight: false },
     activeProjectSettings: { settings: { newWorktreesStartFromOrigin: false } },
     settings: DEFAULT_UNIFIED_SETTINGS,
     providerStatuses: providers,

@@ -1,6 +1,12 @@
+import { thrownErrorMessage } from "@t3tools/client-runtime/errors";
+import {
+  isAtomCommandInterrupted,
+  squashAtomCommandFailure,
+} from "@t3tools/client-runtime/state/runtime";
 import type { EnvironmentThreadShell } from "@t3tools/client-runtime/state/shell";
 import type { UnifiedSettings } from "@t3tools/contracts";
-import { useMessages } from "gt-react";
+import { msg, useMessages } from "gt-react";
+import { m } from "~/i18n/messages";
 import type { Dispatch } from "react";
 import type { ComposerThreadTarget, DraftSessionState } from "../../composerDraftStore";
 import { useStableCallback } from "../../hooks/useStableCallback";
@@ -16,7 +22,9 @@ import {
 import type { deriveThreadStructureRuntime } from "@t3tools/client-runtime/state/thread-execution";
 import { type SetStateAction } from "react";
 import { useNavigate } from "@tanstack/react-router";
-import { toastManager } from "../ui/toast";
+import { threadEnvironment } from "../../state/threads";
+import { useOrchestrationCommand } from "../../state/use-orchestration-command";
+import { stackedThreadToast, toastManager } from "../ui/toast";
 import { resolveAppModelSelectionForInstance } from "../../modelSelection";
 import {
   draftModelSelectionApplies,
@@ -34,6 +42,8 @@ import {
   getStartedThreadModelChangeBlockReason,
   deriveLockedProvider,
   makeModelDisabledReason,
+  resolveRuntimeModePick,
+  type RuntimeModePickRunState,
 } from "../ChatView.logic";
 interface ComposerSelectionInput {
   readonly environmentId: EnvironmentId;
@@ -41,6 +51,7 @@ interface ComposerSelectionInput {
   readonly draftThread: DraftSessionState | null;
   readonly activeThread: EnvironmentThreadShell | undefined;
   readonly activeRuntime: ReturnType<typeof deriveThreadStructureRuntime>;
+  readonly runtimeModePickRun: RuntimeModePickRunState;
   readonly activeProjectSettings: {
     readonly settings: { readonly newWorktreesStartFromOrigin: boolean };
   };
@@ -72,6 +83,7 @@ export function useComposerSelection(input: ComposerSelectionInput) {
     draftThread,
     activeThread,
     activeRuntime,
+    runtimeModePickRun,
     activeProjectSettings,
     settings,
     providerStatuses,
@@ -94,14 +106,43 @@ export function useComposerSelection(input: ComposerSelectionInput) {
   const setComposerDraftRuntimeMode = useComposerDraftStore((store) => store.setRuntimeMode);
   const setDraftThreadContext = useComposerDraftStore((store) => store.setDraftThreadContext);
   const applyThreadModelPick = useApplyThreadModelPick();
+  const setThreadRuntimeMode = useOrchestrationCommand(threadEnvironment.setRuntimeMode, {
+    label: "change permission mode",
+  });
+
+  const applyThreadRuntimeMode = async (threadId: ThreadId, mode: RuntimeMode) => {
+    const result = await setThreadRuntimeMode({
+      environmentId,
+      input: { threadId, runtimeMode: mode, createdAt: new Date().toISOString() },
+    });
+    if (result._tag !== "Failure" || isAtomCommandInterrupted(result)) return;
+    toastManager.add(
+      stackedThreadToast({
+        type: "error",
+        title: m(msg("Couldn't change this setting.")),
+        description:
+          thrownErrorMessage(squashAtomCommandFailure(result), m) ?? m(msg("Try again.")),
+      }),
+    );
+  };
 
   const handleRuntimeModeChange = (mode: RuntimeMode) => {
     if (mode === runtimeMode) return;
     cancelHeldComposerSend(composerTargetKey(composerDraftTarget));
-    setComposerDraftRuntimeMode(composerDraftTarget, mode);
+    const threadRuntimeMode = isLocalDraftThread ? null : (activeThread?.runtimeMode ?? null);
+    const pick = resolveRuntimeModePick(
+      { runtimeMode: mode, runtimeModeBase: threadRuntimeMode ?? undefined, threadRuntimeMode },
+      runtimeModePickRun,
+    );
+    setComposerDraftRuntimeMode(
+      composerDraftTarget,
+      pick === "hold" ? mode : null,
+      threadRuntimeMode ?? undefined,
+    );
     if (isLocalDraftThread) {
       setDraftThreadContext(composerDraftTarget, { runtimeMode: mode });
     }
+    if (pick === "set" && activeThread) void applyThreadRuntimeMode(activeThread.id, mode);
     scheduleComposerFocus();
   };
   const handleRuntimeModeChangeStable = useStableCallback(handleRuntimeModeChange);

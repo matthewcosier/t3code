@@ -21,6 +21,7 @@ import { applyClaudePromptEffortPrefix, resolvePromptInjectedEffort } from "@t3t
 import { getProviderModelCapabilities } from "../providerModels";
 import { sanitizeThreadErrorMessage, thrownErrorMessage } from "@t3tools/client-runtime/errors";
 import type { EnvironmentThread, ThreadStructure } from "@t3tools/client-runtime/state/shell";
+import { isDetailBehindShell } from "@t3tools/client-runtime/state/thread-activity-announcement";
 import {
   ANTIGRAVITY_DEFAULT_MODEL,
   PROVIDER_SEND_TURN_MAX_ATTACHMENTS,
@@ -34,6 +35,7 @@ import {
   type MessageId,
   type ModelSelection,
   type OrchestrationMessageContext,
+  type OrchestrationV2RunStatus,
   type PreviewAnnotationPayload,
   ProviderDriverKind,
   type ProviderInstanceId,
@@ -47,6 +49,7 @@ import {
   type ThreadId,
   type ThreadLinkedPullRequest,
   type RunId,
+  type RuntimeMode,
   type WorktreeSetupSnapshot,
 } from "@t3tools/contracts";
 import { worktreeSetupAgentStarted } from "@t3tools/client-runtime/worktree-setup";
@@ -453,6 +456,80 @@ export function resolveThreadMetadataUpdateForNextTurn(input: {
     ...(modelSelectionChanged ? { modelSelection: nextModelSelection } : {}),
     ...(branchChanged ? { branch: input.nextBranch, worktreePath: null } : {}),
   };
+}
+
+type RunSnapshot = { readonly runId: RunId; readonly status: OrchestrationV2RunStatus };
+
+/** What this client knows of a run on an existing thread when a permission mode is picked. */
+export interface RuntimeModePickRunState {
+  /** The thread's detail, or null while it loads. */
+  readonly detail: {
+    readonly providerInstanceId: ProviderInstanceId;
+    readonly activeRunId: RunId | null;
+    readonly latestRun: RunSnapshot | null;
+    /** Its latest session on that provider takes a new mode without ending its run. */
+    readonly switchesInSession: boolean;
+  } | null;
+  /** The thread's live shell. */
+  readonly shell: {
+    readonly providerInstanceId: ProviderInstanceId;
+    readonly activeRunId: RunId | null;
+    readonly latestRun: RunSnapshot | null;
+  } | null;
+  /** A send from this client that the thread does not show yet. */
+  readonly sendInFlight: boolean;
+}
+
+/**
+ * A mode held for an existing thread's next send, while the thread is still in the mode it was
+ * picked against. A mode set elsewhere since then wins, and a mode stored without its base
+ * predates holding.
+ */
+export function heldRuntimeModePick(
+  draft:
+    | {
+        readonly runtimeMode: RuntimeMode | null;
+        readonly runtimeModeBase?: RuntimeMode | undefined;
+      }
+    | null
+    | undefined,
+  threadRuntimeMode: RuntimeMode,
+): RuntimeMode | null {
+  return draft?.runtimeMode && draft.runtimeModeBase === threadRuntimeMode
+    ? draft.runtimeMode
+    : null;
+}
+
+/**
+ * Setting the mode ends a running turn on a session that cannot switch modes in place, so a pick
+ * is set at once only when no run can be active, or a detail caught up with the live shell says
+ * the session switches in place and no send of this client (which may start a turn on another
+ * provider) is on its way. Otherwise it waits for the next send, which sets it.
+ */
+export function resolveRuntimeModePick(
+  pick: {
+    readonly runtimeMode: RuntimeMode;
+    /** The thread's mode when the pick was made. */
+    readonly runtimeModeBase?: RuntimeMode | undefined;
+    /** The existing thread's mode, or null for a local draft thread, which keeps its pick. */
+    readonly threadRuntimeMode: RuntimeMode | null;
+  },
+  at: RuntimeModePickRunState | "send",
+): "set" | "hold" | "drop" {
+  if (pick.threadRuntimeMode === null) return "hold";
+  const held = heldRuntimeModePick(pick, pick.threadRuntimeMode);
+  if (held === null || held === pick.threadRuntimeMode) return "drop";
+  if (at === "send") return "set";
+  const { detail, shell, sendInFlight } = at;
+  if (!sendInFlight && detail?.activeRunId == null && shell?.activeRunId == null) return "set";
+  const switchesInSession =
+    !sendInFlight &&
+    detail !== null &&
+    shell !== null &&
+    detail.providerInstanceId === shell.providerInstanceId &&
+    !isDetailBehindShell(detail.latestRun, shell.latestRun) &&
+    detail.switchesInSession;
+  return switchesInSession ? "set" : "hold";
 }
 
 export function buildLocalDraftThread(

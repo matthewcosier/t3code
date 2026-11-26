@@ -75,6 +75,7 @@ import {
   deriveLockedProvider,
   hasCompactableConversation,
   hasServerAcknowledgedLocalDispatch,
+  resolveRuntimeModePick,
   waitForRevertedMessage,
 } from "./ChatView.logic";
 
@@ -344,6 +345,107 @@ describe("hasServerAcknowledgedLocalDispatch", () => {
         threadError: null,
       }),
     ).toBe(true);
+  });
+});
+
+describe("resolveRuntimeModePick", () => {
+  const codex = ProviderInstanceId.make("codex");
+  const claude = ProviderInstanceId.make("claude");
+  const finished = { runId: RunId.make("run-1"), status: "completed" as const };
+  const running = { runId: RunId.make("run-1"), status: "running" as const };
+  const idleShell = { providerInstanceId: codex, activeRunId: null, latestRun: finished };
+  const runningShell = {
+    providerInstanceId: codex,
+    activeRunId: running.runId,
+    latestRun: running,
+  };
+  const switching = { switchesInSession: true };
+  const fixed = { switchesInSession: false };
+  const nextRun = { runId: RunId.make("run-2"), status: "running" as const };
+  // Supervised, picked on a thread in Full access.
+  const pick = {
+    runtimeMode: "approval-required",
+    runtimeModeBase: "full-access",
+    threadRuntimeMode: "full-access",
+  } as const;
+
+  it.each<{
+    name: string;
+    pick: Parameters<typeof resolveRuntimeModePick>[0];
+    at: Parameters<typeof resolveRuntimeModePick>[1];
+    expected: ReturnType<typeof resolveRuntimeModePick>;
+  }>([
+    {
+      name: "sets a pick on an idle thread",
+      pick,
+      at: { detail: { ...idleShell, ...fixed }, shell: idleShell, sendInFlight: false },
+      expected: "set",
+    },
+    {
+      name: "sets a pick during a run whose session switches modes in place",
+      pick,
+      at: { detail: { ...runningShell, ...switching }, shell: runningShell, sendInFlight: false },
+      expected: "set",
+    },
+    {
+      name: "holds a pick during a run whose session cannot switch modes in place",
+      pick,
+      at: { detail: { ...runningShell, ...fixed }, shell: runningShell, sendInFlight: false },
+      expected: "hold",
+    },
+    {
+      name: "holds a pick while the detail loads and the shell reports a run",
+      pick,
+      at: { detail: null, shell: runningShell, sendInFlight: false },
+      expected: "hold",
+    },
+    {
+      name: "holds a pick while the detail is behind the shell's run",
+      pick,
+      at: {
+        detail: { ...idleShell, ...switching },
+        shell: { ...runningShell, activeRunId: nextRun.runId, latestRun: nextRun },
+        sendInFlight: false,
+      },
+      expected: "hold",
+    },
+    {
+      name: "holds a pick while the detail is on another provider than the shell",
+      pick,
+      at: {
+        detail: { ...runningShell, ...switching },
+        shell: { ...runningShell, providerInstanceId: claude },
+        sendInFlight: false,
+      },
+      expected: "hold",
+    },
+    {
+      name: "holds a pick while a send that may start the turn on another provider is in flight",
+      pick,
+      at: { detail: { ...idleShell, ...switching }, shell: idleShell, sendInFlight: true },
+      expected: "hold",
+    },
+    { name: "sets a held pick at the next send", pick, at: "send", expected: "set" },
+    {
+      name: "drops a held pick at send once the thread's mode was changed elsewhere",
+      pick: { ...pick, threadRuntimeMode: "auto" },
+      at: "send",
+      expected: "drop",
+    },
+    {
+      name: "ignores a draft mode stored without the mode it was picked against",
+      pick: { runtimeMode: "approval-required", threadRuntimeMode: "full-access" },
+      at: "send",
+      expected: "drop",
+    },
+    {
+      name: "keeps a local draft thread's pick in its draft",
+      pick: { runtimeMode: "approval-required", threadRuntimeMode: null },
+      at: { detail: null, shell: null, sendInFlight: false },
+      expected: "hold",
+    },
+  ])("$name", ({ pick, at, expected }) => {
+    expect(resolveRuntimeModePick(pick, at)).toBe(expected);
   });
 });
 
