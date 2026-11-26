@@ -29,9 +29,11 @@ import * as Exit from "effect/Exit";
 import * as FileSystem from "effect/FileSystem";
 import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
+import * as Option from "effect/Option";
 import * as Path from "effect/Path";
 import * as Queue from "effect/Queue";
 import * as Ref from "effect/Ref";
+import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
 import { ChildProcessSpawner } from "effect/process";
 import * as TestClock from "effect/testing/TestClock";
@@ -43,7 +45,10 @@ import * as McpProviderSessions from "@t3tools/provider-core/server/McpProviderS
 import * as TestProviderHost from "@t3tools/provider-testing/TestProviderHost";
 import type * as AcpSessionRuntime from "@t3tools/provider-acp/server/AcpSessionRuntime";
 import { makeAcpAdapterV2 } from "@t3tools/provider-acp/server/adapter";
-import { makeAntigravityAcpRuntime } from "../../provider/acp/AntigravityAcpSupport.ts";
+import {
+  antigravitySkipsPermissions,
+  makeAntigravityAcpRuntime,
+} from "../../provider/acp/AntigravityAcpSupport.ts";
 import { normalizeAntigravitySessionUpdate } from "../../provider/acp/AntigravityProtocol.ts";
 import { ANTIGRAVITY_SIGN_IN_REQUIRED_MESSAGE } from "../../provider/antigravityAuthSupport.ts";
 import * as IdAllocator from "@t3tools/provider-core/server/IdAllocator";
@@ -56,6 +61,8 @@ import {
   makeAntigravityAcpAdapterFlavor,
   makeAntigravityAdapterV2,
 } from "./AntigravityAdapterV2.ts";
+
+const isProviderAdapterProtocolError = Schema.is(ProviderAdapter.ProviderAdapterProtocolError);
 
 const flavor = makeAntigravityAcpAdapterFlavor({
   instanceId: ProviderInstanceId.make("antigravity-test"),
@@ -2930,6 +2937,211 @@ describe("AntigravityAdapterV2 runtime mode ceiling", () => {
       );
       assert.equal((yield* runtime!.getModeState)?.currentModeId, "default");
       assert.deepEqual(launchModes, ["full-access", "approval-required"]);
+    }).pipe(Effect.provide(layerSession), Effect.scoped),
+  );
+});
+
+describe("AntigravityAdapterV2 mode changes while a turn runs", () => {
+  // Each launch records whether agy got --dangerously-skip-permissions and whether its process
+  // is gone. Only the first launch holds its prompt open, so a later turn can finish.
+  const openRunningTurn = Effect.fn("openRunningTurn")(function* (
+    runtimeMode: "full-access" | "approval-required",
+  ) {
+    const childProcessSpawner = yield* ChildProcessSpawner.ChildProcessSpawner;
+    const path = yield* Path.Path;
+    const crypto = yield* SecureRandom.SecureRandom;
+    const mockAgentPath = yield* path.fromFileUrl(
+      new URL("../../../scripts/acp-mock-agent.ts", import.meta.url),
+    );
+    const launches: Array<{ skipsPermissions: boolean; closed: boolean }> = [];
+    const firstPrompt = yield* Deferred.make<void>();
+    const instanceId = ProviderInstanceId.make("antigravity-live-mode-test");
+    const adapter = yield* makeAntigravityAdapterV2({
+      instanceId,
+      selfInvocation: yield* resolveSelfInvocation(),
+      makeRuntime: (input) => {
+        const launch = {
+          skipsPermissions: antigravitySkipsPermissions(input.runtimePolicy),
+          closed: false,
+        };
+        launches.push(launch);
+        return makeAntigravityAcpRuntime({
+          ...input,
+          childProcessSpawner,
+          spawn: {
+            command: process.execPath,
+            args: [mockAgentPath],
+            cwd: input.cwd,
+            env:
+              launches.length === 1
+                ? { T3_ACP_ANTIGRAVITY: "1", T3_ACP_HANG_PROMPT_FOREVER: "1" }
+                : { T3_ACP_ANTIGRAVITY: "1" },
+          },
+        }).pipe(
+          Effect.provideService(SecureRandom.SecureRandom, crypto),
+          Effect.tap(() =>
+            Effect.addFinalizer(() =>
+              Effect.sync(() => {
+                launch.closed = true;
+              }),
+            ),
+          ),
+          Effect.map((runtime): AcpSessionRuntime.AcpSessionRuntime["Service"] => ({
+            ...runtime,
+            prompt: (request) =>
+              Deferred.succeed(firstPrompt, undefined).pipe(
+                Effect.andThen(runtime.prompt(request)),
+              ),
+          })),
+        );
+      },
+      withProcess: (_stop, task) => task,
+      defaultModel: Effect.undefined,
+    });
+    const threadId = ThreadId.make("thread-antigravity-live-mode");
+    const modelSelection = { instanceId, model: "gemini-test-low" } as const;
+    const policy = (mode: "full-access" | "approval-required" | "auto-accept-edits") =>
+      ProviderAdapter.ProviderAdapterV2RuntimePolicy.make({
+        runtimeMode: mode,
+        interactionMode: "default",
+        cwd: process.cwd(),
+      });
+    const session = yield* adapter.openSession({
+      threadId,
+      providerSessionId: ProviderSessionId.make("provider-session-antigravity-live-mode"),
+      modelSelection,
+      runtimePolicy: policy(runtimeMode),
+    });
+    const events = yield* Queue.unbounded<ProviderAdapter.ProviderAdapterV2Event>();
+    yield* session.events.pipe(
+      Stream.runForEach((event) => Queue.offer(events, event)),
+      Effect.forkScoped,
+    );
+    const providerThread = yield* session.ensureThread({
+      threadId,
+      modelSelection,
+      runtimePolicy: policy(runtimeMode),
+    });
+    const startTurn = (ordinal: number, mode: Parameters<typeof policy>[0]) =>
+      DateTime.now.pipe(
+        Effect.flatMap((now) =>
+          session.startTurn(
+            makeTurnInput({
+              threadId,
+              providerThread,
+              instanceId,
+              runtimePolicy: policy(mode),
+              modelSelection,
+              now,
+              ordinal,
+            }),
+          ),
+        ),
+      );
+    yield* startTurn(1, runtimeMode);
+    yield* Deferred.await(firstPrompt);
+    const nextTerminal = Stream.fromQueue(events).pipe(
+      Stream.filter((event) => event.type === "turn.terminal"),
+      Stream.runHead,
+      Effect.map(Option.getOrThrow),
+    );
+    return { session, providerThread, launches, policy, startTurn, nextTerminal };
+  });
+
+  it.effect.each([
+    {
+      name: "lowered once",
+      applied: ["approval-required"],
+      nextTurn: "approval-required",
+      nextLaunchSkipsPermissions: false,
+    },
+    {
+      name: "lowered, then raised back to Full access",
+      applied: ["approval-required", "full-access"],
+      nextTurn: "full-access",
+      nextLaunchSkipsPermissions: true,
+    },
+  ] as const)(
+    "leaving Full access ($name) ends the agent launched to skip permissions",
+    ({ applied, nextTurn, nextLaunchSkipsPermissions }) =>
+      Effect.gen(function* () {
+        const { session, providerThread, launches, policy, startTurn, nextTerminal } =
+          yield* openRunningTurn("full-access");
+        assert.deepEqual(launches, [{ skipsPermissions: true, closed: false }]);
+
+        for (const mode of applied) {
+          yield* session.applyRuntimePolicy!({ providerThread, runtimePolicy: policy(mode) });
+        }
+        assert.deepEqual(
+          launches.filter((launch) => launch.skipsPermissions && !launch.closed),
+          [],
+          "no agent launched with --dangerously-skip-permissions may keep serving the thread",
+        );
+        const ended = yield* nextTerminal;
+        assert.equal(ended.type === "turn.terminal" && ended.status, "failed");
+
+        yield* startTurn(2, nextTurn);
+        const next = yield* nextTerminal;
+        assert.equal(next.type === "turn.terminal" && next.status, "completed");
+        assert.deepEqual(
+          launches.map((launch) => launch.skipsPermissions),
+          [true, nextLaunchSkipsPermissions],
+        );
+      }).pipe(Effect.provide(layerSession), Effect.scoped),
+  );
+
+  it.effect("lowering the mode ends the background work of a turn held open for it", () =>
+    Effect.gen(function* () {
+      const { session, providerThread, command, startTurn, throughPromptSettled, until } =
+        yield* openSessionWithRunningCommand({ WaitMsBeforeAsync: 10000 });
+      yield* startTurn(1, false);
+      yield* throughPromptSettled;
+
+      yield* session.applyRuntimePolicy!({
+        providerThread,
+        runtimePolicy: ProviderAdapter.ProviderAdapterV2RuntimePolicy.make({
+          runtimeMode: "approval-required",
+          interactionMode: "default",
+          cwd: process.cwd(),
+        }),
+      });
+      const held = yield* session.awaitBackgroundTasks!({
+        providerThread,
+        taskIds: ["mock-session-1/task-2"],
+        awaited: true,
+      });
+      assert.deepEqual(held.matched, [], "no live turn may still hold the command open");
+      const run = yield* until((event) => event.type === "turn.terminal");
+      const terminal = run.at(-1);
+      assert.equal(terminal?.type === "turn.terminal" && terminal.status, "failed");
+      const commandStatus = run
+        .flatMap((event) =>
+          event.type === "turn_item.updated" &&
+          event.turnItem.nativeItemRef?.nativeId === command.toolCallId
+            ? [event.turnItem.status]
+            : [],
+        )
+        .at(-1);
+      assert.equal(commandStatus, "interrupted");
+    }).pipe(Effect.provide(layerSession)),
+  );
+
+  it.effect("a mode change that keeps the launch flag leaves the turn and its agent running", () =>
+    Effect.gen(function* () {
+      const { session, providerThread, launches, policy, startTurn } =
+        yield* openRunningTurn("approval-required");
+
+      yield* session.applyRuntimePolicy!({
+        providerThread,
+        runtimePolicy: policy("auto-accept-edits"),
+      });
+      assert.deepEqual(launches, [{ skipsPermissions: false, closed: false }]);
+      const refusal = yield* startTurn(2, "auto-accept-edits").pipe(Effect.flip);
+      assert.isTrue(
+        isProviderAdapterProtocolError(refusal.cause) &&
+          refusal.cause.reason === "previous_turn_active",
+        "the first turn is still running",
+      );
     }).pipe(Effect.provide(layerSession), Effect.scoped),
   );
 });

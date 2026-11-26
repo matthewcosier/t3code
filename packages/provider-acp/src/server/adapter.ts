@@ -573,6 +573,14 @@ export interface AcpAdapterV2Flavor {
     launchedPolicy: ProviderAdapter.ProviderAdapterV2RuntimePolicy,
     nextPolicy: ProviderAdapter.ProviderAdapterV2RuntimePolicy,
   ) => boolean;
+  /**
+   * Returns true when the process launched under `launchedPolicy` acts without asking the client,
+   * so `nextPolicy` cannot govern it live. Applying such a policy ends that process at once.
+   */
+  readonly runtimeIgnoresLivePolicy?: (
+    launchedPolicy: ProviderAdapter.ProviderAdapterV2RuntimePolicy,
+    nextPolicy: ProviderAdapter.ProviderAdapterV2RuntimePolicy,
+  ) => boolean;
   readonly clientFileSystem?: {
     readonly readTextFile: (
       request: EffectAcpSchema.ReadTextFileRequest,
@@ -10720,6 +10728,69 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
             if (context !== null && context.input.providerThread.id === providerThread.id) {
               context.input = { ...context.input, runtimePolicy };
             }
+            if (flavor.runtimeIgnoresLivePolicy?.(launchedRuntimePolicy, runtimePolicy) !== true) {
+              return;
+            }
+            // The committed mode wins over any work in flight: the process ends now and the next
+            // turn launches under the new policy.
+            yield* runtimeTransitionPermit.withPermit(
+              Effect.gen(function* () {
+                if (
+                  flavor.runtimeIgnoresLivePolicy?.(launchedRuntimePolicy, latestRuntimePolicy) !==
+                  true
+                ) {
+                  return;
+                }
+                const generation = yield* Ref.get(runtimeCallbackGeneration);
+                const retired = yield* runRuntimeCallbackAtGeneration(
+                  generation,
+                  Effect.gen(function* () {
+                    const running = yield* Ref.get(activeTurn);
+                    const carryover = yield* Ref.get(carryoverSubagents);
+                    const endedBackgroundWork =
+                      carryover !== null ||
+                      (yield* Ref.get(runningBackgroundTaskIds)).size > 0 ||
+                      (yield* Ref.get(detachedBackgroundCommands)).size > 0 ||
+                      (running !== null &&
+                        !running.finalized &&
+                        (hasSurvivingBackgroundWork(running) ||
+                          hasDeferredBackgroundWork(running)));
+                    openAgentRequests.clear();
+                    yield* quarantineNativeTransportAtGeneration(generation);
+                    yield* advanceRuntimeCallbackGeneration;
+                    yield* Ref.set(runtimeRestartRequired, true);
+                    yield* quarantineStoppedRun();
+                    yield* cancelPendingRuntimeRequests();
+                    yield* terminalizeCarryoverSubagents(carryover);
+                    if (running !== null && !running.finalized) {
+                      yield* terminalizeOpenRunOwnedItems(running, { terminalizeSubagents: true });
+                      yield* finalizeTurn(
+                        running,
+                        "failed",
+                        makeProviderFailure({
+                          class: "provider_error",
+                          message: `The runtime mode changed, so T3 Code stopped ${flavor.runtimeHarness ?? driver}. Send a message to continue in the new mode.`,
+                        }),
+                      );
+                    }
+                    return {
+                      providerTurnId: running?.providerTurnId ?? null,
+                      endedBackgroundWork,
+                    };
+                  }),
+                );
+                if (Option.isNone(retired)) return;
+                yield* Effect.logWarning("orchestration-v2.acp-runtime-ended-for-policy", {
+                  driver,
+                  providerSessionId: input.providerSessionId,
+                  providerTurnId: retired.value.providerTurnId,
+                  endedBackgroundWork: retired.value.endedBackgroundWork,
+                });
+                if (runtimeScope !== undefined) {
+                  yield* Scope.close(runtimeScope, Exit.void).pipe(Effect.ignore);
+                }
+              }),
+            );
           }),
           steerTurn: Effect.fn("AcpAdapterV2.steerTurn")(
             function* (turnInput) {

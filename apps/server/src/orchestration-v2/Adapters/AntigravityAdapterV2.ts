@@ -292,6 +292,9 @@ export function makeAntigravityAcpAdapterFlavor(
     runtimeModeForSessionMode: antigravityRuntimeModeForSessionMode,
     requiresRuntimeRestartForPolicy: (launchedPolicy, nextPolicy) =>
       antigravitySkipsPermissions(launchedPolicy) !== antigravitySkipsPermissions(nextPolicy),
+    // A process launched to skip permissions never asks, so a narrower mode cannot reach it.
+    runtimeIgnoresLivePolicy: (launchedPolicy, nextPolicy) =>
+      antigravitySkipsPermissions(launchedPolicy) && !antigravitySkipsPermissions(nextPolicy),
     clientFileSystem: {
       readTextFile: (request, cwd) =>
         readAntigravityClientTextFile({
