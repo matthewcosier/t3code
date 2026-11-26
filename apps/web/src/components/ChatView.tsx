@@ -86,7 +86,6 @@ import {
   type ThreadId,
   ProviderInteractionMode,
   resolveIdleCompaction,
-  RuntimeMode,
 } from "@t3tools/contracts";
 import {
   canResumeThread,
@@ -262,6 +261,7 @@ import {
   type ComposerImageAttachment,
   type DraftThreadEnvMode,
   composerTargetKey,
+  heldRuntimeModePick,
   useComposerDraftStore,
   DraftId,
 } from "../composerDraftStore";
@@ -646,6 +646,9 @@ export default function ChatView(props: ChatViewProps) {
   const { resolvedTheme } = useTheme();
   const composerRuntimeMode = useComposerDraftStore(
     (store) => store.getComposerDraft(composerDraftTarget)?.runtimeMode ?? null,
+  );
+  const composerRuntimeModeBase = useComposerDraftStore(
+    (store) => store.getComposerDraft(composerDraftTarget)?.runtimeModeBase,
   );
   const composerActiveProvider = useComposerDraftStore(
     (store) => store.getComposerDraft(composerDraftTarget)?.activeProvider ?? null,
@@ -1064,9 +1067,12 @@ export default function ChatView(props: ChatViewProps) {
   const defaultRuntimeMode = resolveProjectSettings(settings, activeThread?.projectId ?? null)
     .settings.defaultRuntimeMode;
   const runtimeMode =
-    composerRuntimeMode ??
-    (isServerThread ? activeThread?.runtimeMode : undefined) ??
-    defaultRuntimeMode;
+    (isServerThread && activeThread
+      ? (heldRuntimeModePick(
+          { runtimeMode: composerRuntimeMode, runtimeModeBase: composerRuntimeModeBase },
+          activeThread.runtimeMode,
+        ) ?? activeThread.runtimeMode)
+      : composerRuntimeMode) ?? defaultRuntimeMode;
   const isLocalDraftThread = !isServerThread && localDraftThread !== undefined;
   const canCheckoutPullRequestIntoThread = canWriteSourceControl && isLocalDraftThread;
   const activeThreadId = activeThread?.id ?? null;
@@ -2202,7 +2208,6 @@ export default function ChatView(props: ChatViewProps) {
     threadId: ThreadId;
     createdAt: string;
     branch?: string;
-    runtimeMode: RuntimeMode;
     interactionMode: ProviderInteractionMode;
   }): Promise<AtomCommandResult<void, unknown>> => {
     if (!serverThread) {
@@ -2231,13 +2236,19 @@ export default function ChatView(props: ChatViewProps) {
       }
     }
 
-    if (input.runtimeMode !== serverThread.runtimeMode) {
+    const draftStore = useComposerDraftStore.getState();
+    const heldRuntimeMode = heldRuntimeModePick(
+      draftStore.getComposerDraft(composerDraftTarget),
+      serverThread.runtimeMode,
+    );
+    draftStore.setRuntimeMode(composerDraftTarget, null);
+    if (heldRuntimeMode !== null && heldRuntimeMode !== serverThread.runtimeMode) {
       result = mapAtomCommandResult(
         await setThreadRuntimeMode({
           environmentId,
           input: {
             threadId: input.threadId,
-            runtimeMode: input.runtimeMode,
+            runtimeMode: heldRuntimeMode,
             createdAt: input.createdAt,
           },
         }),
@@ -3084,6 +3095,10 @@ export default function ChatView(props: ChatViewProps) {
     void sendStandaloneCommand("/compact", gt("Failed to compact context."));
   };
 
+  const runtimeModeSwitchesInSession =
+    serverProjection?.providerSessions.findLast(
+      (session) => session.providerInstanceId === serverProjection.thread.providerInstanceId,
+    )?.capabilities.sessions.supportsRuntimeModeSwitchInSession === true;
   const {
     getModelDisabledReason,
     handleRuntimeModeChangeStable,
@@ -3097,6 +3112,7 @@ export default function ChatView(props: ChatViewProps) {
     draftThread,
     activeThread,
     activeRuntime,
+    runtimeModeSwitchesInSession,
     activeProjectSettings,
     settings,
     providerStatuses,

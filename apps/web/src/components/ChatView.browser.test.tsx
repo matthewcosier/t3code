@@ -798,6 +798,86 @@ it("Enter on an empty prompt resumes an interrupted thread", async () => {
   );
 });
 
+/**
+ * Opens `thread`, whose server mode is full access, with `held` as its composer's permission
+ * pick, checks which mode the composer offers as current, then sends a message. Returns the
+ * permission modes the send set on the thread.
+ */
+async function sendWithHeldPermissionPick(
+  name: string,
+  held: { readonly mode: "approval-required"; readonly base?: "full-access" | "auto" },
+  shown: "Supervised" | "Full access",
+) {
+  const thread = threadWithHistory(name, 1);
+  const threadRef = scopeThreadRef(ENVIRONMENT_ID, thread.id);
+  using _environment = installFakeEnvironment([thread], { acceptCommands: true });
+  __setClientSettingsForTests({
+    ...DEFAULT_CLIENT_SETTINGS,
+    onboardingCompletedAt: "2026-01-01T00:00:00.000Z",
+  });
+  useComposerDraftStore.getState().setRuntimeMode(threadRef, held.mode, held.base);
+  const router = getRouter(
+    createMemoryHistory({ initialEntries: [`/${ENVIRONMENT_ID}/${thread.id}`] }),
+  );
+  await router.load();
+  await using _app = await render(<AppRoot router={router} />, {
+    // AppRoot brings its own router.
+    router: false,
+  });
+  await expect.element(page.getByText(`Answer 0 for ${thread.id}.`)).toBeVisible();
+
+  // The model picker's footer always offers the mode; the composer chip hides the default one.
+  await page.getByRole("button", { name: "GPT-5.4", exact: true }).click();
+  await page
+    .getByRole("button", { name: /^Permissions: / })
+    .last()
+    .click();
+  await expect
+    .element(page.getByRole("menuitemradio", { name: shown }))
+    .toHaveAttribute("aria-checked", "true");
+  await userEvent.keyboard("{Escape}");
+  await userEvent.keyboard("{Escape}");
+
+  await userEvent.click(page.getByTestId("composer-editor"));
+  await userEvent.keyboard("Next step{Enter}");
+  await vi.waitFor(() =>
+    expect(dispatchedCommands().map((command) => command.type)).toContain("message.dispatch"),
+  );
+  expect(useComposerDraftStore.getState().getComposerDraft(threadRef)?.runtimeMode ?? null).toBe(
+    null,
+  );
+  return dispatchedCommands().flatMap((command) =>
+    command.type === "thread.runtime-mode.set" ? [command.runtimeMode] : [],
+  );
+}
+
+it("a permission pick held for the next send applies once at that send", async () => {
+  const sent = await sendWithHeldPermissionPick(
+    "held-permission-pick",
+    { mode: "approval-required", base: "full-access" },
+    "Supervised",
+  );
+  expect(sent).toEqual(["approval-required"]);
+});
+
+it("a held permission pick made against an older thread mode is dropped at send", async () => {
+  const sent = await sendWithHeldPermissionPick(
+    "stale-permission-pick",
+    { mode: "approval-required", base: "auto" },
+    "Full access",
+  );
+  expect(sent).toEqual([]);
+});
+
+it("a draft permission mode stored without its base is ignored on a server thread", async () => {
+  const sent = await sendWithHeldPermissionPick(
+    "legacy-permission-pick",
+    { mode: "approval-required" },
+    "Full access",
+  );
+  expect(sent).toEqual([]);
+});
+
 it("opening a thread or returning to the window on a touch tablet does not focus the composer", async () => {
   const realMatchMedia = window.matchMedia.bind(window);
   using _touch = vi

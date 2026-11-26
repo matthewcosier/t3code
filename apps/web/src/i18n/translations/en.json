@@ -4875,6 +4875,7 @@
   "49ff70bd86ad6554": "No pull request matches {query}.",
   "df212af6691e3607": "No pull requests found in this repository.",
   "3fd6afd30a7c5f7e": "Could not resume thread.",
+  "82d9edcc961e6c84": "Could not change the permission mode",
   "911a6569f6186971": "Annotation attached to draft",
   "c7f1a1feb620ef35": "Sending is unavailable right now. Finish the current action, then send.",
   "ec460eacd0e94528": "Still sending your previous message.",

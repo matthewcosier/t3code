@@ -288,7 +288,6 @@ interface ComposerSendInput {
     threadId: ThreadId;
     createdAt: string;
     branch?: string;
-    runtimeMode: RuntimeMode;
     interactionMode: ProviderInteractionMode;
   }) => Promise<AtomCommandResult<void, unknown>>;
   /** Links a checked-out pull request to its thread; best effort, failures only logged. */
@@ -1487,7 +1486,6 @@ export function useComposerSend(input: ComposerSendInput) {
         ...(localCheckoutBranchMismatch
           ? { branch: localCheckoutBranchMismatch.currentBranch }
           : {}),
-        runtimeMode,
         interactionMode: DEFAULT_INTERACTION_MODE,
       });
       if (settingsResult._tag === "Failure") {

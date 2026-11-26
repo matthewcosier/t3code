@@ -350,6 +350,7 @@ const PersistedComposerThreadDraftState = Schema.Struct({
   activeProvider: Schema.optionalKey(Schema.NullOr(ProviderInstanceId)),
   modelSelectionExplicit: Schema.optionalKey(Schema.Boolean),
   runtimeMode: Schema.optionalKey(RuntimeMode),
+  runtimeModeBase: Schema.optionalKey(RuntimeMode),
   interactionMode: Schema.optionalKey(ProviderInteractionMode),
 });
 type PersistedComposerThreadDraftState = typeof PersistedComposerThreadDraftState.Type;
@@ -480,7 +481,28 @@ export interface ComposerThreadDraftState {
   activeProvider: ProviderInstanceId | null;
   modelSelectionExplicit?: boolean;
   runtimeMode: RuntimeMode | null;
+  /** The thread's mode when `runtimeMode` was held for an existing thread's next send. */
+  runtimeModeBase?: RuntimeMode;
   interactionMode: ProviderInteractionMode | null;
+}
+
+/**
+ * An existing thread's held pick, while the thread is still in the mode it was picked against.
+ * A newer mode set elsewhere wins, and a pick stored without its base predates holding.
+ */
+export function heldRuntimeModePick(
+  draft:
+    | {
+        readonly runtimeMode: RuntimeMode | null;
+        readonly runtimeModeBase?: RuntimeMode | undefined;
+      }
+    | null
+    | undefined,
+  threadRuntimeMode: RuntimeMode,
+): RuntimeMode | null {
+  return draft?.runtimeMode && draft.runtimeModeBase === threadRuntimeMode
+    ? draft.runtimeMode
+    : null;
 }
 
 export function composerDraftHasUserContent(
@@ -669,6 +691,7 @@ interface ComposerDraftStoreState {
   setRuntimeMode: (
     threadRef: ComposerThreadTarget,
     runtimeMode: RuntimeMode | null | undefined,
+    base?: RuntimeMode,
   ) => void;
   setInteractionMode: (
     threadRef: ComposerThreadTarget,
@@ -936,6 +959,7 @@ function composerDraftContent({
   activeProvider: _activeProvider,
   modelSelectionExplicit: _modelSelectionExplicit,
   runtimeMode: _runtimeMode,
+  runtimeModeBase: _runtimeModeBase,
   interactionMode: _interactionMode,
   ...content
 }: ComposerThreadDraftState) {
@@ -2202,6 +2226,10 @@ function normalizePersistedDraftsByThreadId(
     const runtimeMode = isRuntimeMode(draftCandidate.runtimeMode)
       ? draftCandidate.runtimeMode
       : null;
+    const runtimeModeBase =
+      runtimeMode && isRuntimeMode(draftCandidate.runtimeModeBase)
+        ? draftCandidate.runtimeModeBase
+        : null;
     const interactionMode =
       draftCandidate.interactionMode === "plan" || draftCandidate.interactionMode === "default"
         ? draftCandidate.interactionMode
@@ -2331,6 +2359,7 @@ function normalizePersistedDraftsByThreadId(
           }
         : {}),
       ...(runtimeMode ? { runtimeMode } : {}),
+      ...(runtimeModeBase ? { runtimeModeBase } : {}),
       ...(interactionMode ? { interactionMode } : {}),
     };
   }
@@ -2500,6 +2529,9 @@ export function partializeComposerDraftStoreState(
           }
         : {}),
       ...(draft.runtimeMode ? { runtimeMode: draft.runtimeMode } : {}),
+      ...(draft.runtimeMode && draft.runtimeModeBase
+        ? { runtimeModeBase: draft.runtimeModeBase }
+        : {}),
       ...(draft.interactionMode ? { interactionMode: draft.interactionMode } : {}),
     };
     persistedDraftsByThreadKey[threadKey] = persistedDraft;
@@ -2778,6 +2810,7 @@ function toHydratedThreadDraft(
     activeProvider,
     ...(persistedDraft.modelSelectionExplicit ? { modelSelectionExplicit: true } : {}),
     runtimeMode: persistedDraft.runtimeMode ?? null,
+    ...(persistedDraft.runtimeModeBase ? { runtimeModeBase: persistedDraft.runtimeModeBase } : {}),
     interactionMode: persistedDraft.interactionMode ?? null,
   };
 }
@@ -3541,24 +3574,26 @@ const composerDraftStore = create<ComposerDraftStoreState>()(
             };
           });
         },
-        setRuntimeMode: (threadRef, runtimeMode) => {
+        setRuntimeMode: (threadRef, runtimeMode, base) => {
           const threadKey = resolveComposerDraftKey(get(), threadRef) ?? "";
           if (threadKey.length === 0) {
             return;
           }
           const nextRuntimeMode = isRuntimeMode(runtimeMode) ? runtimeMode : null;
+          const nextBase = nextRuntimeMode !== null && isRuntimeMode(base) ? base : undefined;
           set((state) => {
             const existing = state.draftsByThreadKey[threadKey];
             if (!existing && nextRuntimeMode === null) {
               return state;
             }
-            const base = existing ?? createEmptyThreadDraft();
-            if (base.runtimeMode === nextRuntimeMode) {
+            const { runtimeModeBase, ...current } = existing ?? createEmptyThreadDraft();
+            if (current.runtimeMode === nextRuntimeMode && runtimeModeBase === nextBase) {
               return state;
             }
             const nextDraft: ComposerThreadDraftState = {
-              ...base,
+              ...current,
               runtimeMode: nextRuntimeMode,
+              ...(nextBase ? { runtimeModeBase: nextBase } : {}),
             };
             const nextDraftsByThreadKey = { ...state.draftsByThreadKey };
             if (shouldRemoveDraft(nextDraft)) {
