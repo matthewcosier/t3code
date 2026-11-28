@@ -214,6 +214,7 @@ import {
 import { ProviderInstanceId, ProviderInstanceMutation } from "./providerInstance.ts";
 import {
   IssueCandidates,
+  IssueCandidatesInput,
   IssueCommentInput,
   IssueCommentsPage,
   IssueCommentsPageInput,
@@ -221,11 +222,11 @@ import {
   IssueCreateResult,
   IssueDetail,
   IssueLinkedThreadsResult,
+  IssueDetailInput,
   IssueListInput,
   IssueListResult,
   IssueOperationError,
   IssueReactionInput,
-  IssueRef,
   IssueScopeRef,
   IssueSetStateInput,
   IssueTemplateList,
@@ -810,6 +811,12 @@ export const WsServerRefreshProvidersRpc = Rpc.make(WS_METHODS.serverRefreshProv
      * only when it changed. The other fields are ignored and the config stream carries the result.
      */
     modelCatalogOnly: Schema.optional(Schema.Boolean),
+    /**
+     * Usage limits view refreshed: refresh usage limit sources and provider usage limits in
+     * parallel without full provider health checks, PATH/maintenance lookups, or model discovery.
+     * The config stream carries the result.
+     */
+    limitsOnly: Schema.optional(Schema.Boolean),
     /** Read secret references again; unlocking a vault can prompt on the host, so only explicit user refreshes ask. */
     reloadSecrets: Schema.optional(Schema.Boolean),
     /**
@@ -1487,7 +1494,7 @@ const WsIssuesListRpc = Rpc.make(WS_METHODS.issuesList, {
 });
 
 const WsIssuesDetailRpc = Rpc.make(WS_METHODS.issuesDetail, {
-  payload: IssueRef,
+  payload: IssueDetailInput,
   success: IssueDetail,
   error: IssueRpcError,
 });
@@ -1513,7 +1520,7 @@ const WsIssuesTemplatesRpc = Rpc.make(WS_METHODS.issuesTemplates, {
 
 /** Read when a label or assignee picker opens, not with every issue. */
 const WsIssuesCandidatesRpc = Rpc.make(WS_METHODS.issuesCandidates, {
-  payload: IssueScopeRef,
+  payload: IssueCandidatesInput,
   success: IssueCandidates,
   error: IssueRpcError,
 });

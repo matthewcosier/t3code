@@ -36,7 +36,9 @@ import {
   antigravitySubagentLaunches,
   describeAntigravitySubagentLaunches,
   readAntigravityChildrenAtWork,
+  readAntigravityExecutedModel,
   readAntigravityPendingReply,
+  readAntigravitySubagentTranscript,
 } from "../../provider/acp/AntigravityChildWork.ts";
 import { readAntigravityClientTextFile } from "../../provider/acp/AntigravityClientFiles.ts";
 import { watchAntigravityPromptOutcome } from "../../provider/acp/AntigravityTurnOutcome.ts";
@@ -77,6 +79,7 @@ const AntigravityProviderCapabilitiesV2 = {
   tools: {
     ...AcpProviderCapabilitiesV2.tools,
     supportsMcpTools: true,
+    supportsBackgroundWait: true,
   },
   subagents: {
     ...AcpProviderCapabilitiesV2.subagents,
@@ -301,6 +304,7 @@ export function makeAntigravityAcpAdapterFlavor(
         readAntigravityClientTextFile({
           fileSystem: options.fileSystem,
           path: options.path,
+          cwd,
           allowedRoots: antigravityClientFileRoots(cwd),
           request,
         }),
@@ -337,11 +341,30 @@ export function makeAntigravityAcpAdapterFlavor(
               rootSessionId: sessionId,
               toolCallIds: nativeTaskIds,
             }),
+          readSubagentTranscript: ({
+            sessionId,
+            nativeTaskId,
+            childSessionId,
+            launch,
+            siblings,
+            finalize,
+          }) =>
+            readAntigravitySubagentTranscript({
+              profileDirectory,
+              rootSessionId: sessionId,
+              nativeTaskId,
+              childSessionId,
+              launch,
+              siblings,
+              finalize,
+            }),
           hasPendingReply: (sessionId: string) =>
             readAntigravityPendingReply({
               profileDirectory,
               sessionId,
             }),
+          executedModel: (sessionId: string) =>
+            readAntigravityExecutedModel({ profileDirectory, sessionId }),
         }),
   };
 }

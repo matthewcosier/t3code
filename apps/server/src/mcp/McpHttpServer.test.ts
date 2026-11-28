@@ -59,6 +59,7 @@ import * as McpToolAccess from "./McpToolAccess.ts";
 import * as McpToolAccessTestkit from "./McpToolAccess.testkit.ts";
 import * as McpClientInput from "./McpClientInput.ts";
 import * as McpInvocationContext from "./McpInvocationContext.ts";
+import * as McpProviderSessions from "@t3tools/provider-core/server/McpProviderSessions";
 import * as McpSessionRegistry from "./McpSessionRegistry.ts";
 import * as OrchestratorMcpService from "./OrchestratorMcpService.ts";
 import * as PreviewAutomationBroker from "./PreviewAutomationBroker.ts";
@@ -565,6 +566,34 @@ it.effect("saves the uncapped screenshot while the agent sees the capped one", (
       });
     }),
   ).pipe(Effect.provide(layerTest)),
+);
+
+it.effect("keeps screenshot results only for provider instances that recover them", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const sessions = yield* McpProviderSessions.McpProviderSessions;
+      const png =
+        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jRZkAAAAASUVORK5CYII=";
+      yield* serveSnapshots("mcp-capture-client", {
+        ...snapshotResult,
+        screenshot: { mimeType: "image/png", data: png, width: 1, height: 1 },
+      });
+      const args = { tabId: alternateTabId, includeImage: true };
+
+      yield* callSnapshot(args);
+      expect(yield* sessions.takeToolResult(threadId, "preview_snapshot", args)).toBeUndefined();
+
+      yield* sessions.recoversToolResultImages(invocation.thread.providerInstanceId);
+      yield* callSnapshot(args);
+      expect(yield* sessions.takeToolResult(threadId, "preview_snapshot", args)).toMatchObject({
+        content: [{ type: "image", mimeType: "image/png", data: png }],
+        structuredContent: {
+          url: snapshotResult.url,
+          screenshot: { mimeType: "image/png", width: 1, height: 1 },
+        },
+      });
+    }),
+  ).pipe(Effect.provide(layerTest.pipe(Layer.provideMerge(McpProviderSessions.layer)))),
 );
 
 it.effect("names the screenshot destination when saving it fails", () =>
@@ -2486,6 +2515,18 @@ it.effect("lists optional tools to a deferring client only after tool_search loa
       });
       expect(yield* proxying.listed).toEqual(["delegate_task", "tool_call", "tool_search"]);
 
+      expect(
+        (yield* proxying.call("tool_search", { query: "remind me tomorrow" })).result
+          ?.structuredContent,
+      ).toEqual({
+        tools: [
+          {
+            name: "schedule_task",
+            description: "Schedules a task.",
+            inputSchema: expect.objectContaining({ type: "object" }),
+          },
+        ],
+      });
       // An oversized schema falls back to name + description so the whole response stays <= 8 KB, while small matches keep schemas.
       const budgetSearch = yield* proxying.call("tool_search", { query: "budget" });
       const budgetPayload = budgetSearch.result?.structuredContent as {
